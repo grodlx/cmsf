@@ -52,6 +52,7 @@ class OrderbookStreamer:
         self._subscriptions: List[tuple] = []  # [(condition_id, token_id, side), ...]
         self._pending_subs: List[str] = []  # New token IDs to subscribe
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._force_reconnect = False  # Flag to trigger reconnection
 
     def subscribe(self, condition_id: str, token_up: str, token_down: str):
         """Subscribe to orderbook for a market."""
@@ -85,15 +86,24 @@ class OrderbookStreamer:
         )
 
     def clear_stale(self, active_condition_ids: set):
-        """Remove orderbooks for expired markets."""
+        """Remove orderbooks for expired markets and trigger reconnection."""
         stale_keys = [k for k in self.orderbooks.keys()
                       if k.rsplit('_', 1)[0] not in active_condition_ids]
+
+        had_stale = len(stale_keys) > 0
         for k in stale_keys:
             del self.orderbooks[k]
 
         # Also clean up subscriptions list
+        old_sub_count = len(self._subscriptions)
         self._subscriptions = [(cid, tid, side) for cid, tid, side in self._subscriptions
                                if cid in active_condition_ids]
+
+        # If we removed subscriptions, force reconnect to cleanly re-subscribe
+        # This fixes the issue where WSS gets stuck on stale token IDs
+        if had_stale or len(self._subscriptions) < old_sub_count:
+            print(f"  [OB] Cleared {len(stale_keys)} stale orderbooks, triggering reconnect")
+            self._force_reconnect = True
 
     def on_update(self, callback: Callable):
         """Register a callback for orderbook updates."""
@@ -139,6 +149,12 @@ class OrderbookStreamer:
                     # Listen for updates
                     while self.running:
                         try:
+                            # Check for forced reconnection (markets changed)
+                            if self._force_reconnect:
+                                print("  [OB] Force reconnect triggered, closing connection...")
+                                self._force_reconnect = False
+                                break  # Exit inner loop to reconnect
+
                             # Check for pending subscriptions FIRST (new markets added dynamically)
                             if self._pending_subs:
                                 new_tokens = self._pending_subs.copy()
@@ -217,6 +233,11 @@ class OrderbookStreamer:
                 if ob.token_id == asset_id:
                     ob.last_update = datetime.now(timezone.utc)
                     break
+
+    def reconnect(self):
+        """Force a reconnection to pick up new subscriptions cleanly."""
+        print("  [OB] Manual reconnect requested")
+        self._force_reconnect = True
 
     def stop(self):
         """Stop streaming."""
