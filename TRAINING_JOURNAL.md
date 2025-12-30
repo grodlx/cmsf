@@ -55,14 +55,15 @@ This creates an 18-dimensional state that captures both underlying asset dynamic
 | Position | Has position, side, PnL, time remaining |
 | Regime | Vol regime, trend regime |
 
-### Sparse Reward Signal
+### Sparse Reward Signal (Current Approach)
 
-The agent only receives reward when a position closes. No intermediate feedback while holding.
+After Phase 1's reward shaping failed (see Training Evolution below), we switched to sparse rewards: the agent only receives reward when a position closes. No intermediate feedback while holding.
 
 **Important caveat**: The reward is based on **probability change**, not actual market resolution. When a position closes (either by explicit sell or at market expiry):
 
 ```
-reward = (exit_probability - entry_probability) × size
+UP position:   pnl = (exit_prob - entry_prob) × size
+DOWN position: pnl = (entry_prob - exit_prob) × size
 ```
 
 Example trades:
@@ -71,7 +72,7 @@ Example trades:
 
 Note: At expiry, we use the final probability, not the binary outcome ($1 or $0). This means training signal differs from true realized PnL. The agent learns "did probability move my way?" rather than "did I predict the actual outcome correctly?"
 
-This sparsity makes credit assignment harder. The agent takes actions every tick but only learns from PnL when positions close.
+This sparsity makes credit assignment harder. The agent takes actions every tick but only learns from PnL when positions close. Phase 1 tried to solve this with dense shaping rewards—it backfired.
 
 ---
 
