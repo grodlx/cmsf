@@ -1,6 +1,6 @@
-# Polymarket RL Trading
+# Cross-Market State Fusion
 
-An experiment in training reinforcement learning agents to trade prediction markets using real-time multi-source data fusion.
+RL agents that exploit information lag between fast markets (Binance futures) and slow markets (Polymarket prediction markets) through real-time multi-source state fusion.
 
 **[View the presentation (PDF)](RL_Trading_Agents_Fusion_Breakthrough.pdf)**
 
