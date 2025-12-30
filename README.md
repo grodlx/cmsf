@@ -174,3 +174,21 @@ source venv/bin/activate
 pip install mlx websockets flask flask-socketio numpy requests
 ```
 
+---
+
+## Citation
+
+If you use this work in your research, please cite:
+
+```bibtex
+@software{cross_market_state_fusion,
+  author = {Humanplane},
+  title = {Cross-Market State Fusion: RL Agents for Prediction Market Trading},
+  year = {2025},
+  url = {https://github.com/humanplane/cross-market-state-fusion}
+}
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
