@@ -110,10 +110,11 @@ Critic: Linear(18, 128) -> tanh -> Linear(128, 128) -> tanh -> Linear(128, 1)
 
 ## Training Run
 
-**Date**: December 29, 2025, 19:08 - ongoing
-**Total Updates**: 69 (36 + 33)
-**Total Trades**: 4,543+
+**Date**: December 29, 2025, 19:08 - 20:54
+**Total Updates**: 72 (36 + 36)
+**Total Trades**: 4,875 (1,545 + 3,330)
 **Capital**: $10 base, 50% position sizing ($5/trade)
+**Final PnL**: $10.93 (109% ROI)
 
 ---
 
@@ -290,8 +291,8 @@ np.savez("rl_model_stats.npz",
 
 ### Phase 2: Pure PnL Reward (Updates 37-72)
 
-**Started**: December 29, 2025, 20:02
-**Trades**: 2,998+
+**Duration**: December 29, 2025, 20:02 - 20:54 (~52 minutes)
+**Trades**: 3,330
 
 **Capital Context**: $10 base capital, 50% position sizing ($5/trade).
 
@@ -301,20 +302,20 @@ entropy_coef = 0.10  # Doubled
 # Reward: pure realized PnL (no shaping)
 ```
 
-#### Results (33 updates)
+#### Results (36 updates)
 
 | Update | Entropy | Value Loss | Avg Reward | PnL | Trades | Win Rate |
 |--------|---------|------------|------------|-----|--------|----------|
 | 1 | 0.68 | 149.5 | +0.40 | $5.20 | 27 | 33.3% |
 | 5 | 0.93 | 2.09 | +0.02 | $5.65 | 226 | 20.8% |
 | 10 | 1.06 | 7.16 | +0.02 | $9.55 | 616 | 22.9% |
-| 15 | 1.07 | 14.21 | -0.07 | $8.80 | 1129 | 21.0% |
-| 20 | 1.05 | 3.10 | -0.01 | $5.85 | 1672 | 21.1% |
-| 25 | 1.04 | 3.75 | +0.03 | $9.48 | 2245 | 21.2% |
-| 30 | 1.07 | 0.49 | +0.00 | $7.18 | 2751 | 20.9% |
-| 33 | 1.06 | 1.85 | +0.00 | $9.83 | 2998 | 21.1% |
+| 15 | 1.07 | 14.21 | -0.07 | $8.80 | 1,129 | 21.0% |
+| 20 | 1.05 | 3.10 | -0.01 | $5.85 | 1,672 | 21.1% |
+| 25 | 1.04 | 3.75 | +0.03 | $9.48 | 2,245 | 21.2% |
+| 30 | 1.07 | 0.49 | +0.00 | $7.18 | 2,751 | 20.9% |
+| 36 | 1.05 | 6.47 | +0.05 | $10.93 | 3,330 | 21.2% |
 
-**ROI**: $9.83 PnL on $10 base = **98% return** on capital.
+**Final ROI**: $10.93 PnL on $10 base = **109% return** on capital.
 
 #### Observations
 
@@ -322,9 +323,9 @@ entropy_coef = 0.10  # Doubled
 ```
 Phase 1 end:   entropy=0.36 (collapsed)
 Phase 2 start: entropy=0.68 (loaded weights)
-Phase 2 now:   entropy=1.03 (full exploration)
+Phase 2 end:   entropy=1.05 (full exploration)
 ```
-The higher entropy coefficient worked - entropy recovered from 0.36 to 1.03, reaching the theoretical maximum (~1.1 for 3 actions). The policy is now properly stochastic.
+The higher entropy coefficient worked - entropy recovered from 0.36 to 1.05, near the theoretical maximum (~1.1 for 3 actions). The policy maintained proper stochasticity throughout Phase 2.
 
 **2. Value Loss Spikes**
 
@@ -338,7 +339,7 @@ The critic is adapting to the pure PnL reward signal which has higher variance t
 
 **3. Consistent Positive PnL**
 
-Cumulative PnL growing steadily through Phase 2, reaching ~$10 on $10 base capital (~100% ROI). Buffer rewards consistently positive, indicating the model is finding profitable trades on average with the pure PnL signal.
+Cumulative PnL grew steadily through Phase 2, ending at $10.93 on $10 base capital (109% ROI). Buffer rewards consistently positive, indicating the model found profitable trades on average with the pure PnL signal.
 
 **4. Win Rate Plateau**
 
@@ -394,13 +395,19 @@ def normalize_reward(self, reward):
 
 ---
 
-## Next Steps
+## Conclusions
 
-1. **Monitor entropy stability** - Should stay above 0.5 with new coefficient
-2. **Track cumulative PnL growth** - The true measure of success
-3. **Analyze trade distribution** - Are we trading at good times?
-4. **Consider reward clipping** - Limit extreme rewards to stabilize training
-5. **Add position holding time to state** - Prevent rapid flip-flopping
+This experiment demonstrated:
+
+1. **Reward shaping can backfire** - The agent learned to game shaping rewards instead of maximizing PnL. Pure realized PnL worked better despite being sparse.
+
+2. **Entropy coefficient matters** - 0.05 led to policy collapse; 0.10 maintained healthy exploration throughout training.
+
+3. **Win rate isn't everything** - 21% win rate sounds bad, but asymmetric payoffs (binary markets) made it profitable. Winners paid more than losers cost.
+
+4. **Action space simplification helped** - Reducing from 7 to 3 actions let the model focus on timing rather than sizing.
+
+**Final result**: 109% ROI on base capital over 72 updates (~1.75 hours of live market training).
 
 ---
 

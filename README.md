@@ -10,24 +10,24 @@ PPO agent trading 4 concurrent 15-minute binary prediction markets (BTC, ETH, SO
 
 ## Training Journal
 
-### Current Run: 60 updates, 3,661+ trades
+### Training Complete: 72 updates, 4,875 trades
 
 **Phase 1: Shaped Rewards (Updates 1-36)**
 - Entropy collapsed 1.09 → 0.36 (policy became deterministic)
 - Cause: Reward shaping dominated actual PnL signal
-- Result: $3.90 PnL, 1545 trades, 20% win rate
+- Result: $3.90 PnL, 1,545 trades, 20.2% win rate
 
-**Phase 2: Pure PnL Reward (Updates 37-60)**
+**Phase 2: Pure PnL Reward (Updates 37-72)**
 - Switched to pure realized PnL reward, doubled entropy coefficient (0.05 → 0.10)
-- Entropy recovered to 1.03, model exploring properly
-- Result: $8.50 PnL, 2116 trades, 21.5% win rate
+- Entropy recovered to 1.05, model exploring properly
+- Result: $10.93 PnL, 3,330 trades, 21.2% win rate
 
-| Phase | Update | Entropy | PnL | Trades | Win Rate |
-|-------|--------|---------|-----|--------|----------|
-| 1 | 36 | 0.36 | $3.90 | 1545 | 20.2% |
-| 2 | 36 | 1.04 | $9.78 | 2914 | 21.4% |
+| Phase | Updates | Entropy | PnL | Trades | Win Rate |
+|-------|---------|---------|-----|--------|----------|
+| 1 | 36 | 0.36 | $3.90 | 1,545 | 20.2% |
+| 2 | 36 | 1.05 | $10.93 | 3,330 | 21.2% |
 
-**Context**: $10 base capital, 50% position sizing ($5/trade). Phase 2 PnL of $9.78 = **98% ROI** on base capital.
+**Context**: $10 base capital, 50% position sizing ($5/trade). Phase 2 PnL of $10.93 = **109% ROI** on base capital.
 
 **Key insight**: Win rate ~21% but profitable due to asymmetric payoffs - winners pay more than losers cost.
 
