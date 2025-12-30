@@ -140,7 +140,8 @@ When these diverge, the agent is learning the wrong thing.
 1. Reward ONLY on position close (not every step)
 2. Increased entropy coefficient (0.05 → 0.10)
 3. Simplified action space (7 → 3 actions)
-4. Reset reward normalization stats
+4. Reduced buffer size (2048 → 512) and batch size (128 → 64) for faster updates
+5. Reset reward normalization stats
 
 ```python
 # Reward is 0 for all steps EXCEPT position close
@@ -187,7 +188,9 @@ You can win 40% of the time and break even. Win 21% of the time but pick your sp
 | Aspect | Phase 1 | Phase 2 |
 |--------|---------|---------|
 | Reward | PnL delta + shaping bonuses | Probability-based PnL (normalized) |
-| Entropy coef | 0.05 | 0.10 |
+| Gamma | 0.995 | 0.99 |
+| Entropy coef | 0.02 → 0.05 | 0.10 |
+| Buffer/batch | 2048/128 | 512/64 |
 | Actions | 7 (variable sizing) | 3 (fixed 50%) |
 | Final entropy | 0.36 (collapsed) | 1.05 (healthy) |
 | Final PnL | $3.90 | $10.93 |
@@ -196,11 +199,15 @@ You can win 40% of the time and break even. Win 21% of the time but pick your sp
 
 1. **Removed ALL shaping rewards** - No micro-bonuses, no transaction costs, no spread penalty. Just pure `(exit_prob - entry_prob) * size` on close.
 
-2. **Doubled entropy coefficient** - Stronger exploration incentive. Prevented policy collapse.
+2. **5x entropy coefficient** (0.02 → 0.10) - Stronger exploration incentive. Prevented policy collapse.
 
-3. **Simplified action space** - Reduced from 7 actions (HOLD + 3 buy sizes + 3 sell sizes) to 3 (HOLD, BUY, SELL). Let the model learn *when* to trade before learning *how much*.
+3. **Simplified action space** (7 → 3) - Reduced from HOLD + 3 buy sizes + 3 sell sizes to just HOLD, BUY, SELL. Learn *when* to trade before *how much*.
 
-4. **Reset reward normalization** - Old running stats were calibrated to shaped rewards (mean≈-0.002, std≈0.01). Pure PnL has different distribution.
+4. **Smaller buffer** (2048 → 512) - 4x more frequent updates. Faster learning signal.
+
+5. **Lower gamma** (0.995 → 0.99) - 15-min markets are short; don't over-weight distant rewards.
+
+6. **Reset reward normalization** - Old running stats were calibrated to shaped rewards.
 
 ---
 
