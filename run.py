@@ -30,7 +30,7 @@ from strategies import (
 
 # Dashboard integration (optional)
 try:
-    from dashboard import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
+    from dashboard_cinematic import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
     DASHBOARD_AVAILABLE = True
 except ImportError:
     DASHBOARD_AVAILABLE = False
@@ -147,7 +147,8 @@ class TradingEngine:
         # Close existing position if switching sides
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
-                pnl = (price - pos.entry_price) * pos.size
+                shares = pos.size / pos.entry_price
+                pnl = (price - pos.entry_price) * shares
                 self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
                 self.pending_rewards[cid] = pnl  # Pure realized PnL reward
                 pos.size = 0
@@ -155,7 +156,9 @@ class TradingEngine:
                 return
 
             elif action.is_buy and pos.side == "DOWN":
-                pnl = (pos.entry_price - price) * pos.size
+                exit_down_price = 1 - price  # Current DOWN token price
+                shares = pos.size / pos.entry_price
+                pnl = (exit_down_price - pos.entry_price) * shares  # DOWN token went up = profit
                 self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
                 self.pending_rewards[cid] = pnl  # Pure realized PnL reward
                 pos.size = 0
@@ -179,11 +182,11 @@ class TradingEngine:
             elif action.is_sell:
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = price
+                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
                 pos.entry_time = datetime.now(timezone.utc)
-                pos.entry_prob = price
+                pos.entry_prob = price  # Keep original UP prob for reference
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {price:.3f}")
+                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}")
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
@@ -234,10 +237,12 @@ class TradingEngine:
                 state = self.states.get(cid)
                 if state:
                     price = state.prob
+                    shares = pos.size / pos.entry_price
                     if pos.side == "UP":
-                        pnl = (price - pos.entry_price) * pos.size
+                        pnl = (price - pos.entry_price) * shares
                     else:
-                        pnl = (pos.entry_price - price) * pos.size
+                        exit_down_price = 1 - price
+                        pnl = (exit_down_price - pos.entry_price) * shares
 
                     self._record_trade(pos, price, pnl, f"FORCE CLOSE {pos.side}", cid=cid)
                     self.pending_rewards[cid] = pnl  # Pure realized PnL reward
@@ -354,10 +359,12 @@ class TradingEngine:
                 if pos and pos.size > 0:
                     state.has_position = True
                     state.position_side = pos.side
+                    shares = pos.size / pos.entry_price
                     if pos.side == "UP":
-                        state.position_pnl = (state.prob - pos.entry_price) * pos.size
+                        state.position_pnl = (state.prob - pos.entry_price) * shares
                     else:
-                        state.position_pnl = (pos.entry_price - state.prob) * pos.size
+                        current_down_price = 1 - state.prob
+                        state.position_pnl = (current_down_price - pos.entry_price) * shares
                 else:
                     state.has_position = False
                     state.position_side = None

@@ -594,8 +594,14 @@ HTML_TEMPLATE = """
                     const vel = m.velocity || 0;
                     const timeLeft = m.time_left || 0;
                     let posPnl = 0;
-                    if (hasPos && m.prob) {
-                        posPnl = isLong ? (m.prob - pos.entry_price) * pos.size : (pos.entry_price - m.prob) * pos.size;
+                    if (hasPos && m.prob && pos.entry_price > 0) {
+                        const shares = pos.size / pos.entry_price;
+                        if (isLong) {
+                            posPnl = (m.prob - pos.entry_price) * shares;
+                        } else {
+                            const currentDownPrice = 1 - m.prob;
+                            posPnl = (currentDownPrice - pos.entry_price) * shares;
+                        }
                     }
                     const flowPct = Math.min(50, Math.abs(vel) * 5000);
 

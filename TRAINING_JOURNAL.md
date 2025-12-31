@@ -262,17 +262,62 @@ The critic learned to predict a noisier, more meaningful signal.
 
 ---
 
+### Phase 4: Share-Based PnL (Updates 1-46)
+
+**Changes made**:
+1. Switched from probability-based to share-based PnL reward signal
+2. Increased trade size from $50 to $500 (10x)
+3. Fresh model (no checkpoint)
+
+**Duration**: ~2 hours | **Trades**: 4,873 | **Size**: $500
+
+**The key change**: Reward signal now reflects actual binary market economics.
+
+```python
+# Old (Phases 1-3): probability-based
+pnl = (exit_price - entry_price) * dollars
+
+# New (Phase 4): share-based
+shares = dollars / entry_price
+pnl = (exit_price - entry_price) * shares
+```
+
+**Why this matters**: When you enter at probability 0.30, you get 3.33 shares per dollar vs 1.43 shares at 0.70. The same price move generates proportionally larger returns at lower entry prices. The reward signal now captures this asymmetry.
+
+| Update | Entropy | PnL | Win Rate |
+|--------|---------|-----|----------|
+| 1 | 1.09 | -$197 | 18.9% |
+| 10 | 1.07 | -$383 | 18.0% |
+| 20 | 1.05 | -$465 | 18.5% |
+| 30 | 1.04 | +$1,233 | 19.2% |
+| 46 | 1.08 | +$3,392 | 19.0% |
+
+**Final**: $3,392 PnL on $2,000 max exposure = **170% ROI**
+
+**Comparison to Phase 3** (recalculated with share-based formula):
+- Phase 3: $76 PnL, 38% ROI
+- Phase 4: $3,392 PnL, 170% ROI
+- **4.5x improvement** in ROI per dollar of exposure
+
+**Key observations**:
+- Entropy remained healthy (1.08) throughout - no policy collapse
+- Win rate stable at ~19% - still profitable via asymmetric payoffs
+- Large early drawdown (-$465 at update 20) followed by strong recovery
+- Policy learned to exploit share-based dynamics: seek low-probability entries where price moves generate outsized returns
+
+---
+
 ## Takeaways
 
 1. **Reward shaping is risky** - When shaping rewards are gameable and similar magnitude to the real signal, agents optimize the wrong thing. Sparse but honest > dense but noisy.
 
-2. **Probability-based training is a proxy** - We train on probability deltas, not actual binary outcomes. This correlates with but doesn't equal true realized PnL.
+2. **Reward signal design matters** - Share-based PnL (Phase 4) outperformed probability-based PnL (Phases 2-3) by 4.5x ROI. The reward signal should match actual market economics.
 
 3. **Entropy coefficient matters** - 0.05 caused policy collapse; 0.10 maintained healthy exploration. Small hyperparameter, big impact.
 
 4. **Watch for buffer/trade win rate divergence** - When these diverge, the agent is optimizing the wrong objective.
 
-5. **Robustness to drawdowns** - Phase 3 showed the agent can recover from large adverse moves without policy collapse. Entropy stayed healthy throughout.
+5. **Robustness to drawdowns** - Both Phase 3 and Phase 4 showed the agent can recover from large adverse moves without policy collapse. Entropy stayed healthy throughout.
 
 ---
 

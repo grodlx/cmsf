@@ -20,7 +20,7 @@ A PPO (Proximal Policy Optimization) agent that paper trades Polymarket's 15-min
 
 4. **On-device training is viable** - MLX on Apple Silicon handles real-time PPO updates during live market hours without cloud GPU costs.
 
-**Important caveat**: Training uses probability-based PnL (exit_prob - entry_prob), not actual binary outcomes. This is a proxy signal - the agent learns "did probability move my way?" rather than "did I correctly predict UP vs DOWN?"
+**Important caveat**: Training uses share-based PnL, not actual binary outcomes. See Phase 4 below for why this matters.
 
 ## What This Doesn't Prove
 
@@ -51,12 +51,15 @@ See [TRAINING_JOURNAL.md](TRAINING_JOURNAL.md) for detailed training analysis.
 | Phase | Size | Updates | Trades | PnL | Win Rate | Entropy | ROI |
 |-------|------|---------|--------|-----|----------|---------|-----|
 | 1 (Shaped rewards) | $5 | 36 | 1,545 | $3.90 | 20.2% | 0.36 (collapsed) | - |
-| 2 (Pure PnL) | $5 | 36 | 3,330 | $10.93 | 21.2% | 1.05 (healthy) | 55% |
-| 3 (Scaled up) | $50 | 36 | 4,133 | $23.10 | 15.6% | 0.97 (healthy) | 12% (44%*) |
+| 2 (Prob-based) | $5 | 36 | 3,330 | $10.93 ($11*) | 21.2% | 1.05 (healthy) | 55% (57%*) |
+| 3 (Scaled up) | $50 | 36 | 4,133 | $23.10 ($76*) | 15.6% | 0.97 (healthy) | 12% (38%*) |
+| 4 (Share-based) | $500 | 46 | 4,873 | $3,392 | 19.0% | 1.08 (healthy) | 170% |
 
-**Capital**: Position size × 0.5 × 4 markets = max exposure ($20 Phase 2, $200 Phase 3)
+**Capital**: Position size × 4 markets = max exposure ($20 Phase 2, $200 Phase 3, $2000 Phase 4)
 
-**Key insight**: Phase 3 started with a -$64 drawdown in the first update (unlucky market timing). The agent recovered $87 over the next 35 updates to finish +$23. *44% ROI if measured from the drawdown trough - comparable to Phase 2's 55%.
+*Phases 2-3 used probability-based PnL: `(exit - entry) × dollars`. Phase 4 uses share-based PnL: `(exit - entry) × shares`. The starred values show Phases 2-3 recalculated with share-based formula for comparison.
+
+**Key insight**: Phase 3 started with a -$64 drawdown in the first update (unlucky market timing). The agent recovered $87 over the next 35 updates to finish +$23.
 
 ### Phase 3 Analysis
 
@@ -69,6 +72,23 @@ See [TRAINING_JOURNAL.md](TRAINING_JOURNAL.md) for detailed training analysis.
 - **Entry distribution** (bottom-left): Agent favors extreme probabilities (near 0 or 1) - hunting asymmetric payoffs.
 - **Duration vs PnL** (bottom-middle): Correlation 0.02 - trade length doesn't predict outcome. Quick flips ≈ longer holds.
 - **Entry timing vs PnL** (bottom-right): Correlation 0.01 - early vs late entry in 15-min window doesn't matter. Agent reacts to market state, not time.
+
+### Phase 4 Analysis: Share-Based PnL
+
+![Phase 4 Trading Analysis](phase4_analysis.png)
+
+Phase 4 switched from probability-based to share-based reward signal:
+
+```
+Old (Phases 1-3): pnl = (exit - entry) × dollars
+New (Phase 4):    pnl = (exit - entry) × shares = (exit - entry) × (dollars / entry)
+```
+
+**Why this matters**: Share-based PnL reflects actual binary market economics. When you buy at probability 0.30, you get more shares per dollar than at 0.70. The reward signal now amplifies gains from low-probability entries proportionally.
+
+**Results**: 170% ROI vs 38% (Phase 3 recalculated) — **4.5x improvement** in ROI per dollar of exposure.
+
+**Key observation**: The agent learned to exploit the share-based dynamics. With the reward signal matching actual market mechanics, the policy optimizes for what really matters: finding asymmetric entries where price moves generate outsized returns.
 
 ---
 
