@@ -12,13 +12,15 @@ A PPO (Proximal Policy Optimization) agent that paper trades Polymarket's 15-min
 
 ## What This Proves
 
-1. **RL can learn from sparse PnL signals** - The agent only gets reward when positions close. No intermediate feedback during the 15-minute window. Despite this sparsity, it learns profitable patterns (55% ROI in Phase 2 training).
+1. **RL can learn from sparse PnL signals** - The agent only gets reward when positions close. No intermediate feedback during the 15-minute window. Despite this sparsity, it learns profitable patterns (~$50K PnL, 2,500% ROI in Phase 5 with temporal architecture).
 
 2. **Multi-source data fusion works** - Combining Binance futures order flow and Polymarket orderbook state into a single 18-dim observation gives the agent useful signal.
 
-3. **Low win rate can be profitable** - The agent wins only 21% of trades but profits because binary markets have asymmetric payoffs. Buy at 0.40, win pays 0.60; lose costs 0.40.
+3. **Low win rate can be profitable** - The agent wins only 23% of trades but profits because binary markets have asymmetric payoffs. Buy at 0.40, win pays 0.60; lose costs 0.40.
 
 4. **On-device training is viable** - MLX on Apple Silicon handles real-time PPO updates during live market hours without cloud GPU costs.
+
+5. **Temporal context helps** - Processing the last 5 market states through a TemporalEncoder improves decision quality by capturing momentum and trend patterns.
 
 **Important caveat**: Training uses share-based PnL, not actual binary outcomes. See Phase 4 below for why this matters.
 
@@ -26,9 +28,9 @@ A PPO (Proximal Policy Optimization) agent that paper trades Polymarket's 15-min
 
 1. **Live profitability** - Paper trading assumes instant fills at mid-price. Real trading faces latency, slippage, and market impact. Expect 20-50% performance degradation.
 
-2. **Statistical significance** - 72 updates over 2 hours isn't enough to confirm edge. Could be variance. Needs weeks of out-of-sample testing.
+2. **Statistical significance** - A single session isn't enough to confirm edge. Could be variance. Needs weeks of out-of-sample testing.
 
-3. **Scalability** - $5 positions are invisible to the market. At $100+ the agent's own orders would move prices and consume liquidity.
+3. **Scalability** - $500 positions already show some market impact. At larger sizes the agent's orders would move prices and consume liquidity faster than it can trade.
 
 4. **Persistence of edge** - Markets adapt. If this strategy worked, others would copy it and arbitrage it away.
 
@@ -54,42 +56,13 @@ See [TRAINING_JOURNAL.md](TRAINING_JOURNAL.md) for detailed training analysis.
 | 2 (Prob-based) | $5 | 36 | 3,330 | $10.93 ($11*) | 21.2% | 1.05 (healthy) | 55% (57%*) |
 | 3 (Scaled up) | $50 | 36 | 4,133 | $23.10 ($76*) | 15.6% | 0.97 (healthy) | 12% (38%*) |
 | 4 (Share-based) | $500 | 46 | 4,873 | $3,392 | 19.0% | 1.08 (healthy) | 170% |
-| 5 (Temporal arch) | $50 | 38 | 973 | $3,289 | 22.8% | 1.05 (healthy) | 164% |
+| 5 (LACUNA) | $500 | - | 34,730 | ~$50K | 23.3% | 1.05 (healthy) | 2,500% |
 
-**Capital**: Position size × 4 markets = max exposure ($20 Phase 2, $200 Phase 3, $2000 Phase 4)
+**Capital**: Position size × 4 markets = max exposure ($20 Phase 2, $200 Phase 3, $2000 Phase 4-5)
 
 *Phases 2-3 used probability-based PnL: `(exit - entry) × dollars`. Phase 4 uses share-based PnL: `(exit - entry) × shares`. The starred values show Phases 2-3 recalculated with share-based formula for comparison.
 
-**Key insight**: Phase 3 started with a -$64 drawdown in the first update (unlucky market timing). The agent recovered $87 over the next 35 updates to finish +$23.
-
-### Phase 3 Analysis
-
-![Phase 3 Trading Analysis](phase3_analysis.png)
-
-**Key findings**:
-- **Equity curve** (top-left): -$75 max drawdown early, then steady recovery. Policy didn't collapse under pressure.
-- **PnL by asset** (top-right): XRP carried (+$44), ETH struggled (-$45). Same policy, different results per asset.
-- **PnL by side** (top-right): UP bets (+$16) outperformed DOWN (-$7) despite similar win rates. Slight long bias works.
-- **Entry distribution** (bottom-left): Agent favors extreme probabilities (near 0 or 1) - hunting asymmetric payoffs.
-- **Duration vs PnL** (bottom-middle): Correlation 0.02 - trade length doesn't predict outcome. Quick flips ≈ longer holds.
-- **Entry timing vs PnL** (bottom-right): Correlation 0.01 - early vs late entry in 15-min window doesn't matter. Agent reacts to market state, not time.
-
-### Phase 4 Analysis: Share-Based PnL
-
-![Phase 4 Trading Analysis](phase4_analysis.png)
-
-Phase 4 switched from probability-based to share-based reward signal:
-
-```
-Old (Phases 1-3): pnl = (exit - entry) × dollars
-New (Phase 4):    pnl = (exit - entry) × shares = (exit - entry) × (dollars / entry)
-```
-
-**Why this matters**: Share-based PnL reflects actual binary market economics. When you buy at probability 0.30, you get more shares per dollar than at 0.70. The reward signal now amplifies gains from low-probability entries proportionally.
-
-**Results**: 170% ROI vs 38% (Phase 3 recalculated) — **4.5x improvement** in ROI per dollar of exposure.
-
-**Key observation**: The agent learned to exploit the share-based dynamics. With the reward signal matching actual market mechanics, the policy optimizes for what really matters: finding asymmetric entries where price moves generate outsized returns.
+See [TRAINING_JOURNAL.md](TRAINING_JOURNAL.md) for detailed phase-by-phase analysis with charts.
 
 ---
 
