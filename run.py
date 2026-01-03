@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from collections import deque
 from typing import Dict, List, Optional
 
 sys.path.insert(0, ".")
@@ -36,7 +37,6 @@ class Position:
     size: float = 0.0
     entry_price: float = 0.0
     entry_time: Optional[datetime] = None
-    entry_prob: float = 0.0
     tp_level: float = 0.0
     sl_level: float = 0.0
 
@@ -48,12 +48,14 @@ class TradingEngine:
         self.orderbook_streamer = OrderbookStreamer()
         self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.markets, self.positions, self.states = {}, {}, {}
-        self.prev_states, self.open_prices = {}, {}
+        
+        # --- FILTRY A BUFFERY ---
+        self.prob_buffers = {}    # Pro vyhlazení signálu (SMA)
+        self.atr_buffers = {}     # Pro stabilní výpočet volatility
+        self.cooldowns = {}       # Ochrana proti overtradingu
+        
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
-        self.pending_rewards = {}
-        self.cooldowns = {}  # Ochrana proti overtradingu
         self.running = False
-        self.logger = get_logger() if isinstance(strategy, RLStrategy) else None
         
         os.makedirs("logs", exist_ok=True)
         self.tick_log_path = f"logs/market_ticks_hft_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -61,16 +63,85 @@ class TradingEngine:
 
     def _init_tick_log(self):
         with open(self.tick_log_path, "w") as f:
-            f.write("timestamp,asset,prob,binance_price,vol_5m,spread,imbalance_l1,trade_intensity\n")
+            f.write("timestamp,asset,prob,binance_price,vol_5m,spread\n")
 
-    def _log_market_tick(self, cid, state):
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            with open(self.tick_log_path, "a") as f:
-                f.write(f"{now},{state.asset},{state.prob:.5f},{state.binance_price:.2f},"
-                        f"{state.realized_vol_5m:.6f},{state.spread:.6f},"
-                        f"{state.order_book_imbalance_l1:.4f},{state.trade_intensity:.2f}\n")
-        except: pass
+    def execute_action(self, cid: str, state: MarketState):
+        pos = self.positions.get(cid)
+        if not pos: return
+        now_ts = time.time()
+
+        # 1. --- FILTRACE SIGNÁLU (Smoothing) ---
+        if cid not in self.prob_buffers:
+            self.prob_buffers[cid] = deque(maxlen=5) # 5 ticků = cca 2.5s vyhlazení
+            self.atr_buffers[cid] = deque(maxlen=20)
+
+        self.prob_buffers[cid].append(state.prob)
+        self.atr_buffers[cid].append(state.realized_vol_5m if state.realized_vol_5m > 0 else 0.002)
+        
+        smoothed_prob = sum(self.prob_buffers[cid]) / len(self.prob_buffers[cid])
+        avg_atr = sum(self.atr_buffers[cid]) / len(self.atr_buffers[cid])
+
+        FEE, EXIT_FEE = 1.01, 0.99 # Tvůj požadavek na 1% poplatek
+
+        # 2. --- LOGIKA VÝSTUPU (Hlídání běžící pozice) ---
+        if pos.size > 0:
+            # U Reversalu měříme zisk/ztrátu vůči směru
+            curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
+            
+            is_tp = curr_val >= pos.tp_level
+            is_sl = curr_val <= pos.sl_level
+            
+            if is_tp or is_sl:
+                shares = pos.size / pos.entry_price
+                eff_exit = curr_val * EXIT_FEE
+                pnl = (eff_exit - pos.entry_price) * shares
+                
+                reason = "TAKE_PROFIT" if is_tp else "STOP_LOSS"
+                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
+                
+                pos.size, pos.side = 0, None
+                self.cooldowns[cid] = now_ts + 10 # 10s cooldown po uzavření
+            return
+
+        # 3. --- LOGIKA VSTUPU (REVERSAL s filtrem) ---
+        # Vstupujeme jen pokud je signál vyhlazený a nejsme v cooldownu
+        if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
+            # Musí být dostatek dat v bufferu pro stabilitu
+            if len(self.prob_buffers[cid]) < 5: return
+
+            UPPER_THR = 0.62
+            LOWER_THR = 0.38
+
+            # REVERSAL: Prob > 0.62 -> SHORT (sázka na návrat k 0.5)
+            if smoothed_prob > UPPER_THR:
+                pos.side = "DOWN"
+                pos.entry_price = (1 - state.prob) * FEE # Vstup za reálnou cenu + fee
+                # Nastavení hladin (TP blíž kvůli 1% fee, SL dál pro prostor)
+                pos.tp_level = pos.entry_price + (avg_atr * 1.5)
+                pos.sl_level = pos.entry_price - (avg_atr * 2.5)
+                
+                pos.size = self.trade_size
+                pos.entry_time = datetime.now(timezone.utc)
+                print(f"📉 [REV-ENTRY] SHORT {pos.asset} @ {pos.entry_price:.3f} (S-Prob: {smoothed_prob:.3f})")
+
+            # REVERSAL: Prob < 0.38 -> LONG (sázka na návrat k 0.5)
+            elif smoothed_prob < LOWER_THR:
+                pos.side = "UP"
+                pos.entry_price = state.prob * FEE
+                pos.tp_level = pos.entry_price + (avg_atr * 1.5)
+                pos.sl_level = pos.entry_price - (avg_atr * 2.5)
+                
+                pos.size = self.trade_size
+                pos.entry_time = datetime.now(timezone.utc)
+                print(f"📈 [REV-ENTRY] LONG {pos.asset} @ {pos.entry_price:.3f} (S-Prob: {smoothed_prob:.3f})")
+
+    def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
+        self.total_pnl += pnl
+        self.trade_count += 1
+        if pnl > 0: self.win_count += 1
+        print(f"    {action} {pos.asset} @ {price:.3f} | Realized PnL: ${pnl:+.2f}")
+        emit_trade(action, pos.asset, pos.size, pnl)
+        self._update_dashboard_only()
 
     def refresh_markets(self):
         markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
@@ -85,92 +156,6 @@ class TradingEngine:
             self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=mins_left / 15.0)
             if m.condition_id not in self.positions:
                 self.positions[m.condition_id] = Position(asset=m.asset)
-
-    def execute_action(self, cid: str, action: Action, state: MarketState):
-        pos = self.positions.get(cid)
-        if not pos: return
-        now = time.time()
-
-        FEE, EXIT_FEE = 1.01, 0.99  # Fixní 1% poplatek dle požadavku
-
-        # --- LOGIKA VÝSTUPU (TP / SL / REVERSAL) ---
-        if pos.size > 0:
-            curr_p = state.prob if pos.side == "UP" else (1 - state.prob)
-            
-            # Dynamické hladiny na základě volatility (pokud není, použijem fix 0.01)
-            atr = state.realized_vol_5m if state.realized_vol_5m > 0 else 0.005
-            
-            is_tp = curr_p >= pos.tp_level
-            is_sl = curr_p <= pos.sl_level
-            # Časový exit po 2 minutách pro HFT
-            is_timeout = (datetime.now(timezone.utc) - pos.entry_time).total_seconds() > 120
-
-            if is_tp or is_sl or is_timeout:
-                shares = pos.size / pos.entry_price
-                eff_exit = curr_p * EXIT_FEE
-                pnl = (eff_exit - pos.entry_price) * shares
-                
-                reason = "TP" if is_tp else ("SL" if is_sl else "TIME")
-                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
-                
-                self.pending_rewards[cid] = pnl
-                pos.size, pos.side = 0, None
-                self.cooldowns[cid] = now + 15  # 15s pauza po obchodu
-            return
-
-        # --- LOGIKA VSTUPU (REVERSAL MODE) ---
-        if pos.size == 0 and now > self.cooldowns.get(cid, 0):
-            # Thresholdy pro Reversal
-            UPPER_THR = 0.62
-            LOWER_THR = 0.38
-            
-            atr = state.realized_vol_5m if state.realized_vol_5m > 0 else 0.005
-
-            # Pokud je pravděpodobnost vysoká -> SHORT (DOWN)
-            if state.prob > UPPER_THR:
-                pos.side = "DOWN"
-                pos.entry_price = (1 - state.prob) * FEE
-                pos.tp_level = pos.entry_price + (atr * 1.5)
-                pos.sl_level = pos.entry_price - (atr * 2.0)
-                
-                pos.size = self.trade_size * action.size_multiplier
-                pos.entry_time = datetime.now(timezone.utc)
-                print(f"🚀 REVERSAL OPEN DOWN {pos.asset} @ {pos.entry_price:.3f} (Prob: {state.prob:.3f})")
-
-            # Pokud je pravděpodobnost nízká -> LONG (UP)
-            elif state.prob < LOWER_THR:
-                pos.side = "UP"
-                pos.entry_price = state.prob * FEE
-                pos.tp_level = pos.entry_price + (atr * 1.5)
-                pos.sl_level = pos.entry_price - (atr * 2.0)
-                
-                pos.size = self.trade_size * action.size_multiplier
-                pos.entry_time = datetime.now(timezone.utc)
-                print(f"🚀 REVERSAL OPEN UP {pos.asset} @ {pos.entry_price:.3f} (Prob: {state.prob:.3f})")
-
-    def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
-        self.total_pnl += pnl
-        self.trade_count += 1
-        if pnl > 0: self.win_count += 1
-        print(f"    {action} {pos.asset} @ {price:.3f} | Realized PnL: ${pnl:+.2f}")
-        emit_trade(action, pos.asset, pos.size, pnl)
-        self._update_dashboard_only()
-
-    def _compute_step_reward(self, cid: str, state: MarketState, action: Action, pos: Position) -> float:
-        pnl = self.pending_rewards.pop(cid, 0.0)
-        if pnl == 0: return 0.0
-        penalty = -0.15 
-        return (pnl + penalty) if pnl > 0 else (pnl * 1.5 + penalty)
-
-    def close_all_positions(self):
-        EXIT_FEE = 0.99
-        for cid, pos in self.positions.items():
-            if pos.size > 0 and cid in self.states:
-                state = self.states[cid]
-                eff_exit = (state.prob if pos.side == "UP" else (1 - state.prob)) * EXIT_FEE
-                pnl = (eff_exit - pos.entry_price) * (pos.size / pos.entry_price)
-                self._record_trade(pos, eff_exit, pnl, "FORCE CLOSE", cid=cid)
-                pos.size = 0
 
     def _update_dashboard_only(self):
         try:
@@ -189,40 +174,32 @@ class TradingEngine:
         except: pass
 
     async def decision_loop(self):
-        tick, tick_interval = 0, 0.5 
+        tick, tick_interval = 0, 0.5 # 500ms reakce
         while self.running:
             try:
                 await asyncio.sleep(tick_interval)
                 tick += 1
                 now = datetime.now(timezone.utc)
                 
-                for cid in [c for c, m in self.markets.items() if m.end_time <= now]:
-                    del self.markets[cid]
-                
                 if not self.markets:
                     self.refresh_markets()
-                    await asyncio.sleep(10); continue
+                    await asyncio.sleep(5); continue
                     
                 for cid, m in self.markets.items():
+                    if m.end_time <= now: continue
+                    
                     state = self.states.get(cid)
                     ob = self.orderbook_streamer.get_orderbook(cid, "UP")
                     if ob and ob.mid_price: 
                         state.prob = ob.mid_price
                         state.spread = ob.spread or 0.0
                     
-                    self._log_market_tick(cid, state)
+                    # Spuštění Reversal Engine
+                    self.execute_action(cid, state)
                     
-                    action = self.strategy.act(state)
-                    if isinstance(self.strategy, RLStrategy) and self.strategy.training:
-                        prev = self.prev_states.get(cid)
-                        if prev: self.strategy.store(prev, action, self._compute_step_reward(cid, state, action, self.positions[cid]), state, done=False)
-                        self.prev_states[cid] = copy.deepcopy(state)
-                    
-                    self.execute_action(cid, action, state)
-                    
-                if tick % 20 == 0:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] PnL: ${self.total_pnl:+.2f} | Trades: {self.trade_count}")
-            except asyncio.CancelledError: break
+                if tick % 40 == 0:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] PnL: ${self.total_pnl:+.2f} | Trades: {self.trade_count} | WinRate: { (self.win_count/self.trade_count*100) if self.trade_count > 0 else 0 :.1f}%")
+                    self._update_dashboard_only()
             except Exception as e:
                 print(f"Error in loop: {e}")
 
@@ -238,29 +215,23 @@ class TradingEngine:
         try:
             await asyncio.gather(*tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
-            print("\nShutting down gracefully...")
+            print("\nShutting down...")
         finally:
             self.running = False
             for t in tasks: t.cancel()
             self.close_all_positions()
-            if isinstance(self.strategy, RLStrategy) and self.strategy.training:
-                self.strategy.save("rl_model")
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("strategy", choices=AVAILABLE_STRATEGIES)
-    parser.add_argument("--train", action="store_true")
     parser.add_argument("--size", type=float, default=10.0)
     parser.add_argument("--dashboard", action="store_true")
-    parser.add_argument("--port", type=int, default=5050)
     args = parser.parse_args()
 
     if args.dashboard and DASHBOARD_AVAILABLE:
-        threading.Thread(target=run_dashboard, kwargs={'port': args.port}, daemon=True).start()
+        threading.Thread(target=run_dashboard, kwargs={'port': 5050}, daemon=True).start()
 
     strategy = create_strategy(args.strategy)
-    if isinstance(strategy, RLStrategy) and args.train: strategy.train()
-    
     engine = TradingEngine(strategy, trade_size=args.size)
     await engine.run()
 
