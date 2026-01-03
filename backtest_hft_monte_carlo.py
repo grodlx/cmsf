@@ -14,25 +14,32 @@ FIXED_PENALTY = 0.15 # Fixní náklad pro Ultra model
 class HFTBacktester:
     def __init__(self, log_pattern="logs/market_ticks_hft_*.csv"):
         self.filename = self._find_latest_file(log_pattern)
+        print(f"Pokouším se načíst: {self.filename}")
+        
         self.df = pd.read_csv(self.filename)
-        # Převod na datetime pro správné řazení
+        # Převod na datetime pro správné řazení času
         self.df['timestamp'] = pd.to_datetime(self.df['timestamp'])
         self.df = self.df.sort_values(['asset', 'timestamp'])
-        print(f"Načtena HFT data: {self.filename} ({len(self.df)} tiků)")
+        print(f"Úspěšně načteno: {len(self.df)} tiků.")
 
     def _find_latest_file(self, pattern):
+        # Najde všechny soubory odpovídající masce v logs/
         files = glob.glob(pattern)
         if not files:
-            raise FileNotFoundError("Nebyl nalezen žádný soubor market_ticks_hft_*.csv!")
+            # Zkusíme hledat i v aktuálním adresáři, pokud by logs/ neexistovalo
+            files = glob.glob("market_ticks_hft_*.csv")
+            
+        if not files:
+            raise FileNotFoundError("Nebyl nalezen žádný soubor 'market_ticks_hft_*.csv' ani v logs/, ani v kořenu!")
+        
+        # Vrátí soubor s nejnovějším časem vytvoření
         return max(files, key=os.path.getctime)
 
     def run_simulation(self, cooldown_sec, threshold, penalty_mode=False):
         """Simuluje portfolio obchodování na všech aktivech v logu."""
         total_balance = INITIAL_CAPITAL
-        # Sledujeme pozice pro každé aktivum zvlášť
-        active_positions = {} # {asset: {'entry_p': price, 'entry_t': time, 'side': side, 'size': size}}
         
-        # Seskupíme data podle aktiv, abychom simulovali každé v čase
+        # Simulujeme každé aktivum zvlášť (paralelní trhy)
         for asset, group in self.df.groupby('asset'):
             pos = None
             prices = group['prob'].values
@@ -47,7 +54,7 @@ class HFTBacktester:
                 if pos is None:
                     if signal_strength > (threshold - 0.50):
                         side = "UP" if mid_price > 0.50 else "DOWN"
-                        # Cena s 1% slippage
+                        # Vstupní cena se započtením 1% slippage
                         entry_price = (mid_price if side == "UP" else (1 - mid_price)) * (1 + SLIPPAGE)
                         pos = {
                             'entry_p': entry_price,
@@ -59,24 +66,26 @@ class HFTBacktester:
                 else:
                     duration = (current_time - pos['entry_t']).total_seconds()
                     
-                    # Kontrola Cooldownu a otočení signálu
+                    # Kontrola cooldownu a signálu pro uzavření
                     if duration >= cooldown_sec:
-                        should_close = (pos['side'] == "UP" and mid_price < 0.49) or \
-                                       (pos['side'] == "DOWN" and mid_price > 0.51)
+                        # Pokud jsme v UP, zavřeme když cena klesne, u DOWN naopak
+                        should_close = (pos['side'] == "UP" and mid_price < 0.495) or \
+                                       (pos['side'] == "DOWN" and mid_price > 0.505)
                         
                         if should_close:
                             exit_p_raw = mid_price if pos['side'] == "UP" else (1 - mid_price)
+                            # Výstupní cena se započtením 1% slippage
                             exit_price = exit_p_raw * (1 - SLIPPAGE)
                             
                             shares = TRADE_SIZE / pos['entry_p']
                             trade_pnl = (exit_price - pos['entry_p']) * shares
                             
-                            # Penalizace pro Ultra model (učení agenta)
+                            # Aplikace asymetrické penalizace z vašeho modelu
                             if penalty_mode:
                                 trade_pnl = (trade_pnl - FIXED_PENALTY) if trade_pnl > 0 else (trade_pnl * 1.5 - FIXED_PENALTY)
                             
                             total_balance += trade_pnl
-                            pos = None # Pozice uzavřena
+                            pos = None
                             
         return total_balance - INITIAL_CAPITAL
 
@@ -87,7 +96,6 @@ def main():
         print(f"Chyba: {e}")
         return
 
-    # Definice scénářů pro testování
     scenarios = {
         "HFT: Baseline (No Filters)": (0, 0.50, False),
         "HFT: Cooldown (60s)": (60, 0.50, False),
@@ -97,34 +105,33 @@ def main():
     
     final_results = {}
     print("\n" + "="*50)
-    print("VÝSLEDKY MONTE CARLO (HFT TICK DATA)")
+    print("VÝSLEDKY MONTE CARLO (NASTAVENÍ DLE VAŠICH DAT)")
     print("="*50)
 
     for name, params in scenarios.items():
-        # Monte Carlo prvek: Spustíme simulaci s mírnými náhodnými odchylkami v thresholdu
-        # To simuluje realitu, kde exekuce není vždy v milisekundě přesná
         data = []
-        for _ in range(30): # 30 iterací pro stabilitu
-            noise = np.random.uniform(-0.003, 0.003)
+        # Provedeme 30 simulací s drobným šumem pro ověření robustnosti
+        for _ in range(30):
+            noise = np.random.uniform(-0.002, 0.002)
             res = tester.run_simulation(params[0], params[1] + noise, params[2])
             data.append(res)
         
         final_results[name] = data
         mean_pnl = np.mean(data)
         win_rate = sum(1 for r in data if r > 0) / len(data) * 100
-        print(f"{name:25} | PnL: ${mean_pnl:8.2f} | Win: {win_rate:5.1f}%")
+        print(f"{name:25} | Mean PnL: ${mean_pnl:8.2f} | Win: {win_rate:5.1f}%")
 
-    # Grafické srovnání
+    # Vykreslení grafu
     plt.figure(figsize=(12, 7))
     plt.boxplot(final_results.values(), labels=final_results.keys())
     plt.axhline(0, color='red', linestyle='--', linewidth=1)
-    plt.title(f"HFT Monte Carlo Backtest (Data: {os.path.basename(tester.filename)})")
+    plt.title(f"HFT Backtest (Soubor: {os.path.basename(tester.filename)})")
     plt.ylabel("Čistý zisk/ztráta ($)")
     plt.grid(True, axis='y', alpha=0.3)
     
-    output_img = "hft_backtest_result.png"
-    plt.savefig(output_img)
-    print(f"\nGraf byl uložen jako '{output_img}'")
+    # Uložení výsledku jako obrázek
+    plt.savefig("hft_monte_carlo_final.png")
+    print(f"\nVýsledek uložen do: hft_monte_carlo_final.png")
     plt.show()
 
 if __name__ == "__main__":
