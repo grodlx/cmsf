@@ -235,10 +235,13 @@ def execute_action(self, cid: str, action: Action, state: MarketState):
             )
 
     def _compute_step_reward(self, cid: str, state: MarketState, action: Action, pos: Position) -> float:
-        """Compute reward signal for RL training - pure realized PnL."""
-        # Only reward on position close - cleaner signal
-        # Reward is set when trade closes in _execute_trade via self.pending_rewards
-        return self.pending_rewards.pop(cid, 0.0)
+    reward = self.pending_rewards.pop(cid, 0.0)
+    
+    # Pokud došlo k obchodu (realizované PnL), odečteme fixní "náklad na transakci"
+    if reward != 0:
+        reward -= 2.50  # Fixní penalizace 0.50 USD za exekuci
+        
+    return reward
 
     def close_all_positions(self):
         """Close all positions at current prices."""
