@@ -20,7 +20,17 @@ from strategies import (
     RLStrategy,
 )
 
-# Nastavení logování pro terminál
+# Dashboard integrace
+try:
+    from dashboard_cinematic import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+    def update_dashboard_state(**kwargs): pass
+    def update_rl_metrics(metrics): pass
+    def emit_rl_buffer(buffer_size, max_buffer=256, avg_reward=None): pass
+    def emit_trade(action, asset, size=0, pnl=None): pass
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 @dataclass
@@ -41,19 +51,10 @@ class TradingEngine:
         self.orderbook_streamer = OrderbookStreamer()
         self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.markets, self.positions, self.states = {}, {}, {}
-        
-        # Buffery a filtry
-        self.prob_buffers = {}    
-        self.atr_buffers = {}     
-        self.cooldowns = {}       
-        self.prev_states = {}
-        self.pending_rewards = {}
-        
+        self.prob_buffers, self.atr_buffers, self.cooldowns = {}, {}, {}
+        self.prev_states, self.pending_rewards = {}, {}
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
-        self.running = False
-        
-        # Ošetření timeoutů
-        self.last_market_refresh = 0
+        self.running, self.last_market_refresh = False, 0
 
     def execute_action(self, cid: str, state: MarketState):
         pos = self.positions.get(cid)
@@ -61,15 +62,11 @@ class TradingEngine:
         now_ts = time.time()
 
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=10) 
-            self.atr_buffers[cid] = deque(maxlen=30)
-
-        # Ochrana: Pokud state.prob nepřišel, neprovádíme akci
-        if state.prob is None or state.prob == 0: return
+            self.prob_buffers[cid] = deque(maxlen=5) # Rychlejší reakce (5 ticků)
+            self.atr_buffers[cid] = deque(maxlen=20)
 
         self.prob_buffers[cid].append(state.prob)
-        # Použijeme fixní volatilitu, pokud se nedaří načíst ATR z API, aby bot nezamrzl
-        vol = state.realized_vol_5m if (hasattr(state, 'realized_vol_5m') and state.realized_vol_5m > 0) else 0.004
+        vol = state.realized_vol_5m if (hasattr(state, 'realized_vol_5m') and state.realized_vol_5m > 0) else 0.005
         self.atr_buffers[cid].append(vol)
         
         smoothed_prob = sum(self.prob_buffers[cid]) / len(self.prob_buffers[cid])
@@ -77,7 +74,6 @@ class TradingEngine:
 
         FEE, EXIT_FEE = 1.01, 0.99 
 
-        # LOGIKA VÝSTUPU
         if pos.size > 0:
             curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
             if curr_val >= pos.tp_level or curr_val <= pos.sl_level:
@@ -86,34 +82,23 @@ class TradingEngine:
                 pnl = (eff_exit - pos.entry_price) * shares
                 self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
                 pos.size, pos.side = 0, None
-                self.cooldowns[cid] = now_ts + 10 # Krátký cooldown pro víc obchodů
+                self.cooldowns[cid] = now_ts + 8 # Kratší cooldown pro víc obchodů
             return
 
-        # LOGIKA VSTUPU (REVERSAL)
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
-            # Sníženo na 3 ticky pro rychlejší reakci, aby udělal víc obchodů
             if len(self.prob_buffers[cid]) < 3: return
-
-            # Agresivnější thresholdy pro více obchodů
-            UPPER_THR = 0.60 
-            LOWER_THR = 0.40
+            UPPER_THR, LOWER_THR = 0.60, 0.40 # Agresivnější vstup
 
             if smoothed_prob > UPPER_THR:
-                pos.side = "DOWN"
-                pos.entry_price = (1 - state.prob) * FEE
-                pos.tp_level = pos.entry_price + (avg_atr * 1.2)
-                pos.sl_level = pos.entry_price - (avg_atr * 2.0)
-                pos.size = self.trade_size
-                pos.entry_time = datetime.now(timezone.utc)
+                pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.2)
+                pos.size, pos.entry_time = self.trade_size, datetime.now(timezone.utc)
                 logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f}")
 
             elif smoothed_prob < LOWER_THR:
-                pos.side = "UP"
-                pos.entry_price = state.prob * FEE
-                pos.tp_level = pos.entry_price + (avg_atr * 1.2)
-                pos.sl_level = pos.entry_price - (avg_atr * 2.0)
-                pos.size = self.trade_size
-                pos.entry_time = datetime.now(timezone.utc)
+                pos.side, pos.entry_price = "UP", state.prob * FEE
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.2)
+                pos.size, pos.entry_time = self.trade_size, datetime.now(timezone.utc)
                 logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f}")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
@@ -121,61 +106,60 @@ class TradingEngine:
         self.trade_count += 1
         if pnl > 0: self.win_count += 1
         logging.info(f"💰 {action} {pos.asset} PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
+        emit_trade(action, pos.asset, pos.size, pnl)
+        self._update_dashboard_only()
+
+    def refresh_markets(self):
+        try:
+            markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
+            self.markets.clear()
+            for m in markets:
+                self.markets[m.condition_id] = m
+                self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
+                if m.condition_id not in self.states:
+                    self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up)
+                if m.condition_id not in self.positions:
+                    self.positions[m.condition_id] = Position(asset=m.asset)
+        except Exception as e:
+            logging.error(f"Refresh Error: {e}")
+
+    def _update_dashboard_only(self):
+        if not DASHBOARD_AVAILABLE: return
+        try:
+            now = datetime.now(timezone.utc)
+            d_m, d_p = {}, {}
+            for cid, m in self.markets.items():
+                s, p = self.states.get(cid), self.positions.get(cid)
+                if s:
+                    d_m[cid] = {'asset': m.asset, 'prob': s.prob, 'time_left': (m.end_time-now).total_seconds()/60}
+                    if p and p.size > 0:
+                        cur = s.prob if p.side == "UP" else (1 - s.prob)
+                        d_p[cid] = {'side': p.side, 'size': p.size, 'entry_price': p.entry_price, 'unrealized_pnl': (cur - p.entry_price) * (p.size/p.entry_price)}
+            update_dashboard_state(strategy_name=self.strategy.name, total_pnl=self.total_pnl, trade_count=self.trade_count, win_count=self.win_count, positions=d_p, markets=d_m)
+        except: pass
 
     async def decision_loop(self):
         while self.running:
             try:
-                # 0.5s je ideální pro stabilitu a rychlost
                 await asyncio.sleep(0.5)
-                now = datetime.now(timezone.utc)
                 now_ts = time.time()
-                
-                # Refresh trhů jen jednou za 30 sekund, abychom šetřili REST API (zabrání Timeoutům)
                 if not self.markets or (now_ts - self.last_market_refresh > 30):
-                    try:
-                        self.refresh_markets()
-                        self.last_market_refresh = now_ts
-                    except Exception as e:
-                        logging.error(f"Market refresh failed (Binance Busy): {e}")
-                        await asyncio.sleep(2); continue
+                    self.refresh_markets()
+                    self.last_market_refresh = now_ts
                 
                 for cid, m in list(self.markets.items()):
-                    if m.end_time <= now: continue
-                    
                     state = self.states.get(cid)
-                    if not state: continue
-
-                    # Získáváme data z Orderbook Streameru (WebSocket = Žádný Timeout!)
                     ob = self.orderbook_streamer.get_orderbook(cid, "UP")
                     if ob and ob.mid_price:
                         state.prob = ob.mid_price
                         self.execute_action(cid, state)
-                    
-            except Exception as e:
-                logging.error(f"Loop Error: {e}")
-
-    def refresh_markets(self):
-        # Tato funkce volá REST API, proto ji omezujeme časem výše
-        markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
-        self.markets.clear()
-        for m in markets:
-            self.markets[m.condition_id] = m
-            self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
-            if m.condition_id not in self.states:
-                self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up)
-            if m.condition_id not in self.positions:
-                self.positions[m.condition_id] = Position(asset=m.asset)
+            except Exception as e: logging.error(f"Loop Error: {e}")
 
     async def run(self):
         self.running = True
-        tasks = [
-            asyncio.create_task(self.price_streamer.stream()),
-            asyncio.create_task(self.orderbook_streamer.stream()),
-            asyncio.create_task(self.futures_streamer.stream()),
-            asyncio.create_task(self.decision_loop())
-        ]
-        try:
-            await asyncio.gather(*tasks)
+        tasks = [asyncio.create_task(self.price_streamer.stream()), asyncio.create_task(self.orderbook_streamer.stream()),
+                 asyncio.create_task(self.futures_streamer.stream()), asyncio.create_task(self.decision_loop())]
+        try: await asyncio.gather(*tasks)
         finally:
             self.running = False
             for t in tasks: t.cancel()
@@ -185,14 +169,19 @@ async def main():
     parser.add_argument("strategy", choices=AVAILABLE_STRATEGIES)
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--size", type=float, default=10.0)
+    parser.add_argument("--dashboard", action="store_true")
+    parser.add_argument("--port", type=int, default=5050)
     args = parser.parse_args()
 
+    if args.dashboard and DASHBOARD_AVAILABLE:
+        threading.Thread(target=run_dashboard, kwargs={'port': args.port}, daemon=True).start()
+
     strategy = create_strategy(args.strategy)
+    if isinstance(strategy, RLStrategy) and args.train: strategy.train()
+    
     engine = TradingEngine(strategy, trade_size=args.size)
     await engine.run()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
