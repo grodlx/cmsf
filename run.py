@@ -21,7 +21,6 @@ from strategies import (
     RLStrategy,
 )
 
-# Dashboard integrace
 try:
     from dashboard_cinematic import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
     DASHBOARD_AVAILABLE = True
@@ -52,18 +51,10 @@ class TradingEngine:
         self.orderbook_streamer = OrderbookStreamer()
         self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.markets, self.positions, self.states = {}, {}, {}
-        self.prev_states, self.open_prices = {}, {}
+        self.prev_states, self.pending_rewards = {}, {}
+        self.prob_buffers, self.mean_buffers, self.atr_buffers, self.cooldowns = {}, {}, {}, {}
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
-        self.pending_rewards = {}
-        self.running = False
-        
-        # Buffery a filtry pro stabilitu (Body 1, 3, 4)
-        self.prob_buffers = {}    
-        self.mean_buffers = {}    
-        self.atr_buffers = {}     
-        self.cooldowns = {}       
-        self.last_cleanup = time.time()
-        self.last_market_refresh = 0
+        self.running, self.last_cleanup, self.last_market_refresh = False, time.time(), 0
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
         pos = self.positions.get(cid)
@@ -71,8 +62,8 @@ class TradingEngine:
         now_ts = time.time()
 
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=10)
-            self.mean_buffers[cid] = deque(maxlen=200)
+            self.prob_buffers[cid] = deque(maxlen=8)
+            self.mean_buffers[cid] = deque(maxlen=100) # Zkráceno na ~5 min pro rychlejší adaptaci
             self.atr_buffers[cid] = deque(maxlen=30)
 
         self.prob_buffers[cid].append(state.prob)
@@ -93,37 +84,36 @@ class TradingEngine:
                 eff_exit = curr_val * EXIT_FEE
                 pnl = (eff_exit - pos.entry_price) * shares
                 self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
-                self.pending_rewards[cid] = pnl
                 pos.size, pos.side = 0, None
-                self.cooldowns[cid] = now_ts + 10
+                self.cooldowns[cid] = now_ts + 8
             return
 
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
-            if len(self.mean_buffers[cid]) < 50: return 
+            if len(self.mean_buffers[cid]) < 30: return 
 
-            # Dynamické thresholdy (Bod 3)
-            UPPER_THR = min(max(current_mean + 0.08, 0.58), 0.75)
-            LOWER_THR = max(min(current_mean - 0.08, 0.42), 0.25)
+            # OPRAVA: Dynamické thresholdy se stropem (Hard Cap)
+            # Pokud Mean Driftuje k 0.99, UPPER_THR zůstane na 0.75 a bot stále uvidí extrém
+            UPPER_THR = min(max(current_mean + 0.06, 0.60), 0.72)
+            LOWER_THR = max(min(current_mean - 0.06, 0.40), 0.28)
 
             if smoothed_prob > UPPER_THR:
                 pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.5)
-                pos.size, pos.entry_time = self.trade_size * action.size_multiplier, datetime.now(timezone.utc)
-                logging.info(f"📉 [DYNAMIC-REV] SHORT {pos.asset} | S-Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.2)
+                pos.size = self.trade_size * action.size_multiplier
+                logging.info(f"📉 [REV] SHORT {pos.asset} | Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
 
             elif smoothed_prob < LOWER_THR:
                 pos.side, pos.entry_price = "UP", state.prob * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.5)
-                pos.size, pos.entry_time = self.trade_size * action.size_multiplier, datetime.now(timezone.utc)
-                logging.info(f"📈 [DYNAMIC-REV] LONG {pos.asset} | S-Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.2)
+                pos.size = self.trade_size * action.size_multiplier
+                logging.info(f"📈 [REV] LONG {pos.asset} | Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
         self.trade_count += 1
         if pnl > 0: self.win_count += 1
-        logging.info(f"💰 {action} {pos.asset} @ {price:.3f} | PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
+        logging.info(f"💰 {action} {pos.asset} PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
         emit_trade(action, pos.asset, pos.size, pnl)
-        self._update_dashboard_only()
 
     def refresh_markets(self):
         try:
@@ -141,34 +131,16 @@ class TradingEngine:
                     self.positions[m.condition_id] = Position(asset=m.asset)
         except Exception as e: logging.error(f"Refresh Error: {e}")
 
-    def _update_dashboard_only(self):
-        if not DASHBOARD_AVAILABLE: return
-        try:
-            now = datetime.now(timezone.utc)
-            d_m, d_p = {}, {}
-            for cid, m in self.markets.items():
-                s, p = self.states.get(cid), self.positions.get(cid)
-                if s:
-                    d_m[cid] = {'asset': m.asset, 'prob': s.prob, 'time_left': (m.end_time-now).total_seconds()/60}
-                    if p and p.size > 0:
-                        cur = s.prob if p.side == "UP" else (1 - s.prob)
-                        d_p[cid] = {'side': p.side, 'size': p.size, 'entry_price': p.entry_price, 'unrealized_pnl': (cur-p.entry_price)*(p.size/p.entry_price)}
-            update_dashboard_state(strategy_name=self.strategy.name, total_pnl=self.total_pnl, trade_count=self.trade_count, win_count=self.win_count, positions=d_p, markets=d_m)
-        except: pass
-
     async def decision_loop(self):
         while self.running:
             try:
                 await asyncio.sleep(0.5)
                 now_ts = time.time()
-                
-                # Cleanup (Body 1 & 4)
                 if now_ts - self.last_cleanup > 1800:
                     gc.collect()
-                    self.prob_buffers.clear()
                     self.last_cleanup = now_ts
 
-                if not self.markets or (now_ts - self.last_market_refresh > 40):
+                if not self.markets or (now_ts - self.last_market_refresh > 45):
                     self.refresh_markets()
                     self.last_market_refresh = now_ts
                 
@@ -204,7 +176,6 @@ async def main():
 
     strategy = create_strategy(args.strategy)
     if isinstance(strategy, RLStrategy) and args.train: strategy.train()
-    
     engine = TradingEngine(strategy, trade_size=args.size)
     await engine.run()
 
