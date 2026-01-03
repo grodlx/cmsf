@@ -265,7 +265,7 @@ def execute_action(self, cid: str, action: Action, state: MarketState):
     async def decision_loop(self):
         """Main trading loop."""
         tick = 0
-        tick_interval = 0.5  # 500ms ticks for faster decisions
+        tick_interval = 1.0  # 1s ticks for faster decisions (orig 0.500
         while self.running:
             await asyncio.sleep(tick_interval)
             tick += 1
