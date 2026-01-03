@@ -52,8 +52,8 @@ class TradingEngine:
         self.running = False
         self.logger = get_logger() if isinstance(strategy, RLStrategy) else None
         
-        # Inicializace Tick Logu
-        self.tick_log_path = f"logs/market_ticks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        # Inicializace Tick Logu (sbírá data každých 0.5s)
+        self.tick_log_path = f"logs/market_ticks_hft_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         self._init_tick_log()
 
     def _init_tick_log(self):
@@ -63,7 +63,7 @@ class TradingEngine:
                 f.write("timestamp,asset,prob,binance_price,vol_5m,spread,imbalance_l1,trade_intensity\n")
 
     def _log_market_tick(self, cid, state):
-        """Uloží kompletní stav trhu pro pozdější Monte Carlo analýzu."""
+        """Uloží kompletní stav trhu. Při 0.5s intervalu generuje cca 120 řádků za minutu."""
         now = datetime.now(timezone.utc).isoformat()
         with open(self.tick_log_path, "a") as f:
             f.write(f"{now},{state.asset},{state.prob:.5f},{state.binance_price:.2f},"
@@ -91,15 +91,14 @@ class TradingEngine:
         pos = self.positions.get(cid)
         if not pos: return
 
-        # DYNAMICKÝ THRESHOLD (filtrace šumu)
+        # DYNAMICKÝ THRESHOLD (Filtrace šumu i pro HFT)
+        # Stále držíme ochranu proti vstupu do "padesátiprocentního šumu"
         prob_dist = abs(state.prob - 0.50)
         if pos.size == 0 and prob_dist < 0.04: return
 
         FEE, EXIT_FEE = 1.01, 0.99
         if pos.size > 0:
-            # COOLDOWN 45s
-            if (datetime.now(timezone.utc) - pos.entry_time).total_seconds() < 45: return
-            
+            # COOLDOWN ODSTRANĚN dle požadavku - umožníme okamžité výstupy
             if (action.is_sell and pos.side == "UP") or (action.is_buy and pos.side == "DOWN"):
                 shares = pos.size / pos.entry_price
                 eff_exit = (state.prob if pos.side == "UP" else (1 - state.prob)) * EXIT_FEE
@@ -115,19 +114,20 @@ class TradingEngine:
             else:
                 pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
             pos.size, pos.entry_time = self.trade_size * action.size_multiplier, datetime.now(timezone.utc)
-            print(f"    OPEN {pos.asset} {pos.side} @ {pos.entry_price:.3f}")
+            print(f"    OPEN {pos.asset} {pos.side} @ {pos.entry_price:.3f} (HFT Mode)")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
         self.trade_count += 1
         if pnl > 0: self.win_count += 1
-        print(f"    {action} {pos.asset} @ {price:.3f} | PnL: ${pnl:+.2f}")
+        print(f"    {action} {pos.asset} @ {price:.3f} | Realized PnL: ${pnl:+.2f}")
         emit_trade(action, pos.asset, pos.size, pnl)
         self._update_dashboard_only()
 
     def _compute_step_reward(self, cid: str, state: MarketState, action: Action, pos: Position) -> float:
         pnl = self.pending_rewards.pop(cid, 0.0)
         if pnl == 0: return 0.0
+        # Trestáme overtrading i bez cooldownu asymetrickou penalizací
         penalty = -0.15 
         return (pnl + penalty) if pnl > 0 else (pnl * 1.5 + penalty)
 
@@ -156,13 +156,12 @@ class TradingEngine:
             update_dashboard_state(strategy_name=self.strategy.name, total_pnl=self.total_pnl, trade_count=self.trade_count, win_count=self.win_count, positions=dashboard_p, markets=dashboard_m)
 
     async def decision_loop(self):
-        tick, tick_interval = 0, 5.0
+        tick, tick_interval = 0, 0.5  # VRÁCENO NA 0.5 SEKUNDY (HFT)
         while self.running:
             await asyncio.sleep(tick_interval)
             tick += 1
             now = datetime.now(timezone.utc)
             
-            # Vyčištění expirovaných trhů
             for cid in [c for c, m in self.markets.items() if m.end_time <= now]:
                 del self.markets[cid]
             
@@ -178,7 +177,7 @@ class TradingEngine:
                     state.prob = ob.mid_price
                     state.spread = ob.spread or 0.0
                 
-                # SBĚR TICK DAT PRO MONTE CARLO
+                # ZÁPIS TICKU (Při 0.5s získáme maximální detail dat pro simulaci)
                 self._log_market_tick(cid, state)
                 
                 action = self.strategy.act(state)
@@ -189,8 +188,8 @@ class TradingEngine:
                 
                 self.execute_action(cid, action, state)
                 
-            if tick % 5 == 0: 
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] PnL: ${self.total_pnl:+.2f} | Trades: {self.trade_count}")
+            if tick % 20 == 0: # Status každých 10 sekund (při 0.5s intervalu)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] HFT ACTIVE | PnL: ${self.total_pnl:+.2f} | Trades: {self.trade_count}")
 
     async def run(self):
         self.running = True
