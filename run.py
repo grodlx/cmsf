@@ -21,12 +21,15 @@ from strategies import (
     RLStrategy,
 )
 
+# Dashboard integrace
 try:
     from dashboard_cinematic import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
     DASHBOARD_AVAILABLE = True
 except ImportError:
     DASHBOARD_AVAILABLE = False
     def update_dashboard_state(**kwargs): pass
+    def update_rl_metrics(metrics): pass
+    def emit_rl_buffer(buffer_size, max_buffer=256, avg_reward=None): pass
     def emit_trade(action, asset, size=0, pnl=None): pass
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -49,17 +52,18 @@ class TradingEngine:
         self.orderbook_streamer = OrderbookStreamer()
         self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.markets, self.positions, self.states = {}, {}, {}
+        self.prev_states, self.pending_rewards = {}, {}
         self.prob_buffers, self.atr_buffers, self.cooldowns = {}, {}, {}
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
         self.running, self.last_cleanup, self.last_market_refresh = False, time.time(), 0
 
-    def execute_action(self, cid: str, state: MarketState):
+    def execute_action(self, cid: str, action: Action, state: MarketState):
         pos = self.positions.get(cid)
         if not pos: return
         now_ts = time.time()
 
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=12) # Vyhlazování pro trend filtr
+            self.prob_buffers[cid] = deque(maxlen=12)
             self.atr_buffers[cid] = deque(maxlen=30)
 
         self.prob_buffers[cid].append(state.prob)
@@ -71,58 +75,45 @@ class TradingEngine:
 
         FEE, EXIT_FEE = 1.01, 0.99 
 
-        # --- LOGIKA VÝSTUPU ---
         if pos.size > 0:
             curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
             duration = now_ts - pos.entry_time
-            
-            # Dynamické hladiny (TP blíž, SL dál pro "oddych")
-            is_tp = curr_val >= pos.tp_level
-            is_sl = curr_val <= pos.sl_level
-            is_timeout = duration > 50 # Time exit
-
-            if is_tp or is_sl or is_timeout:
+            if curr_val >= pos.tp_level or curr_val <= pos.sl_level or duration > 50:
                 shares = pos.size / pos.entry_price
                 eff_exit = curr_val * EXIT_FEE
                 pnl = (eff_exit - pos.entry_price) * shares
-                reason = "TP" if is_tp else ("SL" if is_sl else "TIME")
-                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
+                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
                 pos.size, pos.side = 0, None
-                self.cooldowns[cid] = now_ts + 10 # Odpočinek po obchodu
+                self.cooldowns[cid] = now_ts + 10
             return
 
-        # --- LOGIKA VSTUPU (S TRENDOVÝM FILTREM) ---
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
             if len(self.prob_buffers[cid]) < 10: return
 
-            # TREND FILTER: Pokud posledních 5 hodnot jde stále nahoru/dolů, nejdeme proti nim
+            # TREND EXHAUSTION FILTER
             history = list(self.prob_buffers[cid])
             is_trending_up = all(history[i] < history[i+1] for i in range(-5, -1))
             is_trending_down = all(history[i] > history[i+1] for i in range(-5, -1))
 
-            UPPER_THR = 0.63
-            LOWER_THR = 0.37
+            UPPER_THR, LOWER_THR = 0.62, 0.38
 
-            # SHORT REVERSAL (Pouze pokud cena neroste prudce)
             if smoothed_prob > UPPER_THR and not is_trending_up:
                 pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
-                # TP musí pokrýt 1% poplatek -> násobíme ATR
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.5)
-                pos.size, pos.entry_time = self.trade_size, now_ts
-                logging.info(f"📉 [ANTI-TREND] SHORT {pos.asset} @ {pos.entry_price:.3f}")
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.5)
+                pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
+                logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f}")
 
-            # LONG REVERSAL (Pouze pokud cena nepadá prudce)
             elif smoothed_prob < LOWER_THR and not is_trending_down:
                 pos.side, pos.entry_price = "UP", state.prob * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.5)
-                pos.size, pos.entry_time = self.trade_size, now_ts
-                logging.info(f"📈 [ANTI-TREND] LONG {pos.asset} @ {pos.entry_price:.3f}")
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.5)
+                pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
+                logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f}")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
         self.trade_count += 1
         if pnl > 0: self.win_count += 1
-        logging.info(f"💰 {action} {pos.asset} | PnL: ${pnl:+.2f} | Realized Total: ${self.total_pnl:.2f}")
+        logging.info(f"💰 {action} {pos.asset} | PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
         emit_trade(action, pos.asset, pos.size, pnl)
         self._update_dashboard_only()
 
@@ -138,6 +129,22 @@ class TradingEngine:
                 markets={cid: {'asset': m.asset, 'prob': self.states[cid].prob} for cid, m in self.markets.items()}
             )
         except: pass
+
+    def refresh_markets(self):
+        try:
+            markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
+            now = datetime.now(timezone.utc)
+            self.markets.clear()
+            for m in markets:
+                mins_left = (m.end_time - now).total_seconds() / 60
+                if mins_left < 0.5: continue
+                self.markets[m.condition_id] = m
+                self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
+                if m.condition_id not in self.states:
+                    self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=mins_left / 15.0)
+                if m.condition_id not in self.positions:
+                    self.positions[m.condition_id] = Position(asset=m.asset)
+        except Exception as e: logging.error(f"Refresh Error: {e}")
 
     async def decision_loop(self):
         while self.running:
@@ -156,21 +163,8 @@ class TradingEngine:
                     ob = self.orderbook_streamer.get_orderbook(cid, "UP")
                     if ob and ob.mid_price:
                         state.prob = ob.mid_price
-                        self.execute_action(cid, state)
+                        self.execute_action(cid, self.strategy.act(state), state)
             except Exception as e: logging.error(f"Loop Error: {e}")
-
-    def refresh_markets(self):
-        try:
-            markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
-            self.markets.clear()
-            for m in markets:
-                self.markets[m.condition_id] = m
-                self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
-                if m.condition_id not in self.states:
-                    self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=1.0)
-                if m.condition_id not in self.positions:
-                    self.positions[m.condition_id] = Position(asset=m.asset)
-        except Exception as e: logging.error(f"Refresh Error: {e}")
 
     async def run(self):
         self.running = True
@@ -184,12 +178,15 @@ class TradingEngine:
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("strategy", choices=AVAILABLE_STRATEGIES)
+    parser.add_argument("--train", action="store_true")
     parser.add_argument("--size", type=float, default=10.0)
     parser.add_argument("--dashboard", action="store_true")
+    parser.add_argument("--port", type=int, default=5051)
     args = parser.parse_args()
     if args.dashboard and DASHBOARD_AVAILABLE:
-        threading.Thread(target=run_dashboard, kwargs={'port': 5051}, daemon=True).start()
+        threading.Thread(target=run_dashboard, kwargs={'port': args.port}, daemon=True).start()
     strategy = create_strategy(args.strategy)
+    if isinstance(strategy, RLStrategy) and args.train: strategy.train()
     engine = TradingEngine(strategy, trade_size=args.size)
     await engine.run()
 
