@@ -133,7 +133,7 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute paper trade with flexible sizing and 1% SLIPPAGE/FEE."""
         if action == Action.HOLD:
             return
 
@@ -143,24 +143,32 @@ class TradingEngine:
 
         price = state.prob
         trade_amount = self.trade_size * action.size_multiplier
+        
+        # DEFINICE POPLATKU (1% = 0.01)
+        FEE = 1.01 # Při nákupu platíme o 1% víc
+        EXIT_FEE = 0.99 # Při prodeji dostaneme o 1% méně
 
         # Close existing position if switching sides
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
                 shares = pos.size / pos.entry_price
-                pnl = (price - pos.entry_price) * shares
-                self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
-                self.pending_rewards[cid] = pnl  # Pure realized PnL reward
+                # Simulujeme, že prodáváme za horší cenu
+                effective_exit_price = price * EXIT_FEE
+                pnl = (effective_exit_price - pos.entry_price) * shares
+                self._record_trade(pos, effective_exit_price, pnl, "CLOSE UP", cid=cid)
+                self.pending_rewards[cid] = pnl
                 pos.size = 0
                 pos.side = None
                 return
 
             elif action.is_buy and pos.side == "DOWN":
-                exit_down_price = 1 - price  # Current DOWN token price
+                exit_down_price = 1 - price
                 shares = pos.size / pos.entry_price
-                pnl = (exit_down_price - pos.entry_price) * shares  # DOWN token went up = profit
-                self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
-                self.pending_rewards[cid] = pnl  # Pure realized PnL reward
+                # Simulujeme, že prodáváme za horší cenu
+                effective_exit_price = exit_down_price * EXIT_FEE
+                pnl = (effective_exit_price - pos.entry_price) * shares
+                self._record_trade(pos, effective_exit_price, pnl, "CLOSE DOWN", cid=cid)
+                self.pending_rewards[cid] = pnl
                 pos.size = 0
                 pos.side = None
                 return
@@ -172,21 +180,23 @@ class TradingEngine:
             if action.is_buy:
                 pos.side = "UP"
                 pos.size = trade_amount
-                pos.entry_price = price
+                # Nákup za horší cenu (o 1% vyšší)
+                pos.entry_price = price * FEE
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {price:.3f}")
+                print(f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {pos.entry_price:.3f} (slip included)")
                 emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
 
             elif action.is_sell:
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
+                # Nákup za horší cenu (o 1% vyšší pro DOWN token)
+                pos.entry_price = (1 - price) * FEE
                 pos.entry_time = datetime.now(timezone.utc)
-                pos.entry_prob = price  # Keep original UP prob for reference
+                pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}")
+                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {pos.entry_price:.3f} (slip included)")
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
