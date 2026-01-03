@@ -5,7 +5,7 @@ import copy
 import sys
 import threading
 import os
-import signal
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -37,7 +37,8 @@ class Position:
     entry_price: float = 0.0
     entry_time: Optional[datetime] = None
     entry_prob: float = 0.0
-    time_remaining_at_entry: float = 0.0
+    tp_level: float = 0.0
+    sl_level: float = 0.0
 
 class TradingEngine:
     def __init__(self, strategy: Strategy, trade_size: float = 10.0):
@@ -50,10 +51,10 @@ class TradingEngine:
         self.prev_states, self.open_prices = {}, {}
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
         self.pending_rewards = {}
+        self.cooldowns = {}  # Ochrana proti overtradingu
         self.running = False
         self.logger = get_logger() if isinstance(strategy, RLStrategy) else None
         
-        # Inicializace Tick Logu (HFT režim)
         os.makedirs("logs", exist_ok=True)
         self.tick_log_path = f"logs/market_ticks_hft_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         self._init_tick_log()
@@ -84,35 +85,68 @@ class TradingEngine:
             self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=mins_left / 15.0)
             if m.condition_id not in self.positions:
                 self.positions[m.condition_id] = Position(asset=m.asset)
-            price = self.price_streamer.get_price(m.asset)
-            if price > 0: self.open_prices[m.condition_id] = price
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        if action == Action.HOLD: return
         pos = self.positions.get(cid)
         if not pos: return
+        now = time.time()
 
-        prob_dist = abs(state.prob - 0.50)
-        if pos.size == 0 and prob_dist < 0.04: return
+        FEE, EXIT_FEE = 1.01, 0.99  # Fixní 1% poplatek dle požadavku
 
-        FEE, EXIT_FEE = 1.01, 0.99
+        # --- LOGIKA VÝSTUPU (TP / SL / REVERSAL) ---
         if pos.size > 0:
-            if (action.is_sell and pos.side == "UP") or (action.is_buy and pos.side == "DOWN"):
+            curr_p = state.prob if pos.side == "UP" else (1 - state.prob)
+            
+            # Dynamické hladiny na základě volatility (pokud není, použijem fix 0.01)
+            atr = state.realized_vol_5m if state.realized_vol_5m > 0 else 0.005
+            
+            is_tp = curr_p >= pos.tp_level
+            is_sl = curr_p <= pos.sl_level
+            # Časový exit po 2 minutách pro HFT
+            is_timeout = (datetime.now(timezone.utc) - pos.entry_time).total_seconds() > 120
+
+            if is_tp or is_sl or is_timeout:
                 shares = pos.size / pos.entry_price
-                eff_exit = (state.prob if pos.side == "UP" else (1 - state.prob)) * EXIT_FEE
+                eff_exit = curr_p * EXIT_FEE
                 pnl = (eff_exit - pos.entry_price) * shares
-                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
+                
+                reason = "TP" if is_tp else ("SL" if is_sl else "TIME")
+                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
+                
                 self.pending_rewards[cid] = pnl
                 pos.size, pos.side = 0, None
-                return
+                self.cooldowns[cid] = now + 15  # 15s pauza po obchodu
+            return
 
-        if pos.size == 0:
-            if action.is_buy:
-                pos.side, pos.entry_price = "UP", state.prob * FEE
-            else:
-                pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
-            pos.size, pos.entry_time = self.trade_size * action.size_multiplier, datetime.now(timezone.utc)
-            print(f"    OPEN {pos.asset} {pos.side} @ {pos.entry_price:.3f}")
+        # --- LOGIKA VSTUPU (REVERSAL MODE) ---
+        if pos.size == 0 and now > self.cooldowns.get(cid, 0):
+            # Thresholdy pro Reversal
+            UPPER_THR = 0.62
+            LOWER_THR = 0.38
+            
+            atr = state.realized_vol_5m if state.realized_vol_5m > 0 else 0.005
+
+            # Pokud je pravděpodobnost vysoká -> SHORT (DOWN)
+            if state.prob > UPPER_THR:
+                pos.side = "DOWN"
+                pos.entry_price = (1 - state.prob) * FEE
+                pos.tp_level = pos.entry_price + (atr * 1.5)
+                pos.sl_level = pos.entry_price - (atr * 2.0)
+                
+                pos.size = self.trade_size * action.size_multiplier
+                pos.entry_time = datetime.now(timezone.utc)
+                print(f"🚀 REVERSAL OPEN DOWN {pos.asset} @ {pos.entry_price:.3f} (Prob: {state.prob:.3f})")
+
+            # Pokud je pravděpodobnost nízká -> LONG (UP)
+            elif state.prob < LOWER_THR:
+                pos.side = "UP"
+                pos.entry_price = state.prob * FEE
+                pos.tp_level = pos.entry_price + (atr * 1.5)
+                pos.sl_level = pos.entry_price - (atr * 2.0)
+                
+                pos.size = self.trade_size * action.size_multiplier
+                pos.entry_time = datetime.now(timezone.utc)
+                print(f"🚀 REVERSAL OPEN UP {pos.asset} @ {pos.entry_price:.3f} (Prob: {state.prob:.3f})")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
@@ -155,7 +189,7 @@ class TradingEngine:
         except: pass
 
     async def decision_loop(self):
-        tick, tick_interval = 0, 0.5 # HFT 0.5s
+        tick, tick_interval = 0, 0.5 
         while self.running:
             try:
                 await asyncio.sleep(tick_interval)
@@ -207,11 +241,9 @@ class TradingEngine:
             print("\nShutting down gracefully...")
         finally:
             self.running = False
-            # Zrušení úloh před vypnutím loopu
             for t in tasks: t.cancel()
             self.close_all_positions()
             if isinstance(self.strategy, RLStrategy) and self.strategy.training:
-                print("Saving RL model...")
                 self.strategy.save("rl_model")
 
 async def main():
