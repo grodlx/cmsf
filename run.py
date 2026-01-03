@@ -7,6 +7,7 @@ import threading
 import os
 import time
 import logging
+import gc
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from collections import deque
@@ -27,11 +28,8 @@ try:
 except ImportError:
     DASHBOARD_AVAILABLE = False
     def update_dashboard_state(**kwargs): pass
-    def update_rl_metrics(metrics): pass
-    def emit_rl_buffer(buffer_size, max_buffer=256, avg_reward=None): pass
     def emit_trade(action, asset, size=0, pnl=None): pass
 
-# Nastavení logování
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 @dataclass
@@ -56,78 +54,83 @@ class TradingEngine:
         self.positions: Dict[str, Position] = {}
         self.states: Dict[str, MarketState] = {}
         
-        self.prob_buffers = {}    
+        # Buffery s omezenou délkou (Bod 1 & 4)
+        self.prob_buffers = {}    # Pro vyhlazení (krátké)
+        self.mean_buffers = {}    # Pro dynamický střed (dlouhé - Bod 3)
         self.atr_buffers = {}     
         self.cooldowns = {}       
-        self.prev_states = {}
-        self.pending_rewards = {}
         
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
-        self.running, self.last_market_refresh = False, 0
+        self.running = False
+        self.last_market_refresh = 0
+        self.last_cleanup = time.time()
 
     def execute_action(self, cid: str, state: MarketState):
         pos = self.positions.get(cid)
         if not pos: return
         now_ts = time.time()
 
-        # 1. FILTRACE SIGNÁLU (Smoothing)
+        # Inicializace bufferů pokud neexistují
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=5) 
-            self.atr_buffers[cid] = deque(maxlen=20)
+            self.prob_buffers[cid] = deque(maxlen=10) # 5s vyhlazení
+            self.mean_buffers[cid] = deque(maxlen=200) # ~10 min pro určení "středu"
+            self.atr_buffers[cid] = deque(maxlen=30)
 
+        # Ukládání dat
         self.prob_buffers[cid].append(state.prob)
-        # Použití realized_vol_5m nebo defaultní hodnoty
+        self.mean_buffers[cid].append(state.prob)
+        
         vol = getattr(state, 'realized_vol_5m', 0.005)
         if vol <= 0: vol = 0.005
         self.atr_buffers[cid].append(vol)
         
+        # Výpočty (Bod 3 - Dynamika)
         smoothed_prob = sum(self.prob_buffers[cid]) / len(self.prob_buffers[cid])
+        current_mean = sum(self.mean_buffers[cid]) / len(self.mean_buffers[cid])
         avg_atr = sum(self.atr_buffers[cid]) / len(self.atr_buffers[cid])
 
         FEE, EXIT_FEE = 1.01, 0.99 
 
-        # 2. LOGIKA VÝSTUPU
+        # Hlídání otevřené pozice
         if pos.size > 0:
             curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
-            is_tp = curr_val >= pos.tp_level
-            is_sl = curr_val <= pos.sl_level
-            
-            if is_tp or is_sl:
+            if curr_val >= pos.tp_level or curr_val <= pos.sl_level:
                 shares = pos.size / pos.entry_price
                 eff_exit = curr_val * EXIT_FEE
                 pnl = (eff_exit - pos.entry_price) * shares
-                
-                reason = "TAKE_PROFIT" if is_tp else "STOP_LOSS"
-                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
-                
-                self.pending_rewards[cid] = pnl
+                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
                 pos.size, pos.side = 0, None
-                self.cooldowns[cid] = now_ts + 10 # 10s cooldown
+                self.cooldowns[cid] = now_ts + 10
             return
 
-        # 3. LOGIKA VSTUPU (REVERSAL MODE)
+        # Vstupní logika (Reversal vůči dynamickému středu)
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
-            if len(self.prob_buffers[cid]) < 3: return
+            if len(self.mean_buffers[cid]) < 50: return # Potřebujeme data pro střed
 
-            UPPER_THR, LOWER_THR = 0.60, 0.40
+            # Bod 3: Thresholdy jsou relativní k průměru posledních 10 minut
+            # Pokud je průměr 0.55, tak Horní hranice není 0.60, ale 0.55 + 0.10 = 0.65
+            UPPER_THR = current_mean + 0.08
+            LOWER_THR = current_mean - 0.08
+
+            # Ochrana: Thresholdy nesmí vyletět mimo logické hranice
+            UPPER_THR = min(max(UPPER_THR, 0.58), 0.75)
+            LOWER_THR = max(min(LOWER_THR, 0.42), 0.25)
 
             if smoothed_prob > UPPER_THR:
                 pos.side = "DOWN"
                 pos.entry_price = (1 - state.prob) * FEE
-                pos.tp_level = pos.entry_price + (avg_atr * 1.3)
-                pos.sl_level = pos.entry_price - (avg_atr * 2.2)
+                pos.tp_level = pos.entry_price + (avg_atr * 1.2)
+                pos.sl_level = pos.entry_price - (avg_atr * 2.5)
                 pos.size = self.trade_size
-                pos.entry_time = datetime.now(timezone.utc)
-                logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f} (Prob: {smoothed_prob:.3f})")
+                logging.info(f"📉 [DYNAMIC-REV] SHORT {pos.asset} | Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
 
             elif smoothed_prob < LOWER_THR:
                 pos.side = "UP"
                 pos.entry_price = state.prob * FEE
-                pos.tp_level = pos.entry_price + (avg_atr * 1.3)
-                pos.sl_level = pos.entry_price - (avg_atr * 2.2)
+                pos.tp_level = pos.entry_price + (avg_atr * 1.2)
+                pos.sl_level = pos.entry_price - (avg_atr * 2.5)
                 pos.size = self.trade_size
-                pos.entry_time = datetime.now(timezone.utc)
-                logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f} (Prob: {smoothed_prob:.3f})")
+                logging.info(f"📈 [DYNAMIC-REV] LONG {pos.asset} | Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
@@ -135,7 +138,6 @@ class TradingEngine:
         if pnl > 0: self.win_count += 1
         logging.info(f"💰 {action} {pos.asset} PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
         emit_trade(action, pos.asset, pos.size, pnl)
-        self._update_dashboard_only()
 
     def refresh_markets(self):
         try:
@@ -145,40 +147,13 @@ class TradingEngine:
             for m in markets:
                 mins_left = (m.end_time - now).total_seconds() / 60
                 if mins_left < 0.5: continue
-                
                 self.markets[m.condition_id] = m
                 self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
-                
-                # OPRAVA: Inicializace MarketState s time_remaining
                 if m.condition_id not in self.states:
-                    self.states[m.condition_id] = MarketState(
-                        asset=m.asset, 
-                        prob=m.price_up, 
-                        time_remaining=mins_left / 15.0
-                    )
-                else:
-                    self.states[m.condition_id].time_remaining = mins_left / 15.0
-                
+                    self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=mins_left/15.0)
                 if m.condition_id not in self.positions:
                     self.positions[m.condition_id] = Position(asset=m.asset)
-            logging.info(f"🔄 Markets refreshed: {len(self.markets)} active")
-        except Exception as e:
-            logging.error(f"❌ Refresh Error: {e}")
-
-    def _update_dashboard_only(self):
-        if not DASHBOARD_AVAILABLE: return
-        try:
-            now = datetime.now(timezone.utc)
-            d_m, d_p = {}, {}
-            for cid, m in self.markets.items():
-                s, p = self.states.get(cid), self.positions.get(cid)
-                if s:
-                    d_m[cid] = {'asset': m.asset, 'prob': s.prob, 'time_left': (m.end_time-now).total_seconds()/60}
-                    if p and p.size > 0:
-                        cur = s.prob if p.side == "UP" else (1 - s.prob)
-                        d_p[cid] = {'side': p.side, 'size': p.size, 'entry_price': p.entry_price, 'unrealized_pnl': (cur - p.entry_price) * (p.size/p.entry_price)}
-            update_dashboard_state(strategy_name=self.strategy.name, total_pnl=self.total_pnl, trade_count=self.trade_count, win_count=self.win_count, positions=d_p, markets=d_m)
-        except: pass
+        except Exception as e: logging.error(f"Refresh Error: {e}")
 
     async def decision_loop(self):
         while self.running:
@@ -186,20 +161,28 @@ class TradingEngine:
                 await asyncio.sleep(0.5)
                 now_ts = time.time()
                 
-                if not self.markets or (now_ts - self.last_market_refresh > 30):
+                # Bod 1 & 4: Pravidelné čištění paměti a reset driftu každých 30 minut
+                if now_ts - self.last_cleanup > 1800:
+                    logging.info("🧹 Periodic system cleanup (Memory & Drift reset)...")
+                    gc.collect() # Vynucené uvolnění RAM
+                    self.prob_buffers.clear() # Resetujeme krátké buffery pro novou kalibraci
+                    self.last_cleanup = now_ts
+
+                if not self.markets or (now_ts - self.last_market_refresh > 40):
                     self.refresh_markets()
                     self.last_market_refresh = now_ts
                 
                 for cid, m in list(self.markets.items()):
                     state = self.states.get(cid)
-                    if state is None: continue # Ochrana proti NoneType
+                    if not state: continue
                     
                     ob = self.orderbook_streamer.get_orderbook(cid, "UP")
                     if ob and ob.mid_price:
                         state.prob = ob.mid_price
+                        # Ochrana proti šílenému spreadu (Bod 4)
+                        if ob.spread and ob.spread > 0.01: continue 
                         self.execute_action(cid, state)
-            except Exception as e: 
-                logging.error(f"⚠️ Loop Error: {e}")
+            except Exception as e: logging.error(f"Loop Error: {e}")
 
     async def run(self):
         self.running = True
@@ -209,37 +192,25 @@ class TradingEngine:
             asyncio.create_task(self.futures_streamer.stream()),
             asyncio.create_task(self.decision_loop())
         ]
-        try:
-            await asyncio.gather(*tasks)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logging.info("Shutting down...")
+        try: await asyncio.gather(*tasks)
         finally:
             self.running = False
             for t in tasks: t.cancel()
-            if isinstance(self.strategy, RLStrategy) and getattr(self.strategy, 'training', False):
-                self.strategy.save("rl_model")
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("strategy", choices=AVAILABLE_STRATEGIES)
-    parser.add_argument("--train", action="store_true")
     parser.add_argument("--size", type=float, default=10.0)
     parser.add_argument("--dashboard", action="store_true")
-    parser.add_argument("--port", type=int, default=5050)
     args = parser.parse_args()
 
     if args.dashboard and DASHBOARD_AVAILABLE:
-        threading.Thread(target=run_dashboard, kwargs={'port': args.port}, daemon=True).start()
+        threading.Thread(target=run_dashboard, kwargs={'port': 5050}, daemon=True).start()
 
     strategy = create_strategy(args.strategy)
-    if isinstance(strategy, RLStrategy) and args.train:
-        strategy.train()
-    
     engine = TradingEngine(strategy, trade_size=args.size)
     await engine.run()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
