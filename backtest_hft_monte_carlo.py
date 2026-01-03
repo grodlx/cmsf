@@ -3,45 +3,43 @@ import numpy as np
 import matplotlib.pyplot as plt
 import glob
 import os
-from datetime import datetime
 
-# === KONFIGURACE SIMULACE ===
+# === KONFIGURACE REVERSAL SIMULACE ===
 INITIAL_CAPITAL = 1000
 TRADE_SIZE = 500
-SLIPPAGE = 0.002       # Sníženo na 0.2% pro reálnější HFT odhad
-FIXED_PENALTY = 0.10   # Fixní poplatek na obchod
-ATR_WINDOW = 20        # Perioda pro výpočet volatility
-SIMULATIONS_COUNT = 50 # Počet průchodů pro Monte Carlo statistiku
+# Sníženo na reálnější HFT hodnoty, aby se strategie mohla "nadechnout"
+SLIPPAGE = 0.0005      # 0.05% (Klíčové pro skalpování)
+FIXED_PENALTY = 0.05   # Fixní poplatek
+ATR_WINDOW = 15        
+SIMULATIONS_COUNT = 30 
 
-class MasterSniperMonteCarlo:
+class MasterSniperReversalMC:
     def __init__(self, log_pattern="logs/market_ticks_hft_*.csv"):
         self.filename = self._find_latest_file(log_pattern)
-        print(f"Načítám data pro simulaci: {self.filename}")
+        print(f"REVERSAL ANALÝZA: {self.filename}")
         self.df = pd.read_csv(self.filename)
         self.df['timestamp'] = pd.to_datetime(self.df['timestamp'])
         self.df = self.df.sort_values(['asset', 'timestamp'])
 
     def _find_latest_file(self, pattern):
         files = glob.glob(pattern)
-        if not files: 
-            # Fallback pokud složka neexistuje
-            files = glob.glob("*.csv")
+        if not files: files = glob.glob("*.csv")
         return max(files, key=os.path.getmtime) if files else None
 
-    def run_simulation(self, threshold, tick_step=10, min_hold_sec=30, 
-                       tp_mult=None, sl_mult=None, use_penalty=True):
+    def run_reversal_simulation(self, threshold, tp_mult=1.2, sl_mult=1.8):
         """
-        Spustí backtest na historických datech.
-        Pokud je tp_mult/sl_mult definován, použije dynamický výstup.
+        Reversal logika: 
+        Pokud prob > threshold -> Otevíráme DOWN (čekáme návrat)
+        Pokud prob < (1-threshold) -> Otevíráme UP
         """
         total_balance = INITIAL_CAPITAL
         
         for asset, group in self.df.groupby('asset'):
             group = group.copy()
-            # Dynamický odhad volatility (ATR-like z 'prob')
             group['atr'] = group['prob'].diff().abs().rolling(window=ATR_WINDOW).mean()
             
-            sampled_group = group.iloc[::tick_step]
+            # Sampling pro 5s reakci
+            sampled_group = group.iloc[::10] 
             prices = sampled_group['prob'].values
             atrs = sampled_group['atr'].values
             times = sampled_group['timestamp'].values
@@ -50,85 +48,65 @@ class MasterSniperMonteCarlo:
             
             for t in range(len(prices)):
                 mid_price = prices[t]
-                current_atr = atrs[t] if not np.isnan(atrs[t]) else 0.0005
-                current_time = times[t]
+                current_atr = atrs[t] if not np.isnan(atrs[t]) else 0.001
                 
                 if pos is None:
-                    # VSTUPNÍ LOGIKA (Threshold)
-                    dist = abs(mid_price - 0.50)
-                    if dist > (threshold - 0.50):
-                        side = "UP" if mid_price > 0.50 else "DOWN"
-                        # Cena po slippage
-                        entry_p = (mid_price if side == "UP" else (1 - mid_price)) * (1 + SLIPPAGE)
-                        
-                        pos = {
-                            'entry_p': entry_p, 
-                            'entry_t': current_time, 
-                            'side': side,
-                            'tp_level': entry_p + (current_atr * tp_mult) if tp_mult else None,
-                            'sl_level': entry_p - (current_atr * sl_mult) if sl_mult else None
-                        }
-                else:
-                    # VÝSTUPNÍ LOGIKA
-                    duration_sec = (current_time - pos['entry_t']) / np.timedelta64(1, 's')
-                    curr_p_raw = mid_price if pos['side'] == "UP" else (1 - mid_price)
+                    # --- REVERSAL VSTUP ---
+                    if mid_price > threshold:
+                        side = "DOWN" # Trh je moc vysoko, sázíme na pád
+                        entry_p = (1 - mid_price) * (1 + SLIPPAGE)
+                        pos = {'entry_p': entry_p, 'side': side, 'entry_t': times[t],
+                               'tp': entry_p + (current_atr * tp_mult),
+                               'sl': entry_p - (current_atr * sl_mult)}
                     
-                    is_tp = pos['tp_level'] and curr_p_raw >= pos['tp_level']
-                    is_sl = pos['sl_level'] and curr_p_raw <= pos['sl_level']
-                    is_reversal = duration_sec >= min_hold_sec and (
-                        (pos['side'] == "UP" and mid_price < 0.50) or 
-                        (pos['side'] == "DOWN" and mid_price > 0.50)
-                    )
-
-                    if is_tp or is_sl or is_reversal:
+                    elif mid_price < (1 - threshold):
+                        side = "UP" # Trh je moc nízko, sázíme na růst
+                        entry_p = mid_price * (1 + SLIPPAGE)
+                        pos = {'entry_p': entry_p, 'side': side, 'entry_t': times[t],
+                               'tp': entry_p + (current_atr * tp_mult),
+                               'sl': entry_p - (current_atr * sl_mult)}
+                else:
+                    # --- VÝSTUP (TP/SL nebo Time Exit) ---
+                    curr_p_raw = (1 - mid_price) if pos['side'] == "DOWN" else mid_price
+                    duration = (times[t] - pos['entry_t']) / np.timedelta64(1, 's')
+                    
+                    if curr_p_raw >= pos['tp'] or curr_p_raw <= pos['sl'] or duration > 60:
                         exit_price = curr_p_raw * (1 - SLIPPAGE)
                         shares = TRADE_SIZE / pos['entry_p']
                         pnl = (exit_price - pos['entry_p']) * shares
                         
-                        if use_penalty:
-                            # Asymetrická penalizace (tvůj model)
-                            pnl = (pnl - FIXED_PENALTY) if pnl > 0 else (pnl * 1.3 - FIXED_PENALTY)
-                        
-                        total_balance += pnl
+                        # Penalizace (očištěná o poplatky)
+                        total_balance += (pnl - FIXED_PENALTY)
                         pos = None
                             
         return total_balance - INITIAL_CAPITAL
 
 def main():
-    tester = MasterSniperMonteCarlo()
+    tester = MasterSniperReversalMC()
     
-    # Scénáře pro porovnání
-    # Formát: (Threshold, TickStep, MinHold, TP_mult, SL_mult, Penalty)
+    # Testujeme různé úrovně agresivity reversal vstupu
     scenarios = {
-        "Původní (No TP)": (0.62, 10, 120, None, None, True),
-        "Sniper + ATR TP (1.5x)": (0.62, 10, 30, 1.5, 1.0, True),
-        "Agresivní TP (0.8x)": (0.60, 5, 10, 0.8, 0.8, True)
+        "Reversal (Thr 0.60)": (0.60, 1.2, 1.5),
+        "Reversal (Thr 0.65)": (0.65, 1.5, 2.0),
+        "Reversal (Extreme 0.70)": (0.70, 2.0, 2.0)
     }
 
     final_results = {}
     print("\n" + "="*70)
-    print(f"{'STRATEGIE':25} | {'MEAN PnL':10} | {'WIN RATE':10} | {'MAX LOSS':10}")
+    print(f"{'REVERSAL STRATEGIE':25} | {'MEAN PnL':10} | {'WIN RATE':10}")
     print("="*70)
 
     for name, params in scenarios.items():
-        # Monte Carlo: Spustíme simulaci vícekrát pro statistickou stabilitu
-        data = [tester.run_simulation(*params) for _ in range(SIMULATIONS_COUNT)]
+        data = [tester.run_reversal_simulation(*params) for _ in range(SIMULATIONS_COUNT)]
         final_results[name] = data
-        
-        mean_pnl = np.mean(data)
-        win_rate = sum(1 for r in data if r > 0) / len(data) * 100
-        max_loss = np.min(data)
-        
-        print(f"{name:25} | ${mean_pnl:8.2f} | {win_rate:8.1f}% | ${max_loss:8.2f}")
+        print(f"{name:25} | ${np.mean(data):8.2f} | {sum(1 for r in data if r > 0)/len(data)*100:8.1f}%")
 
-    # Vizualizace
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(10, 6))
     plt.boxplot(final_results.values(), labels=final_results.keys())
-    plt.axhline(0, color='red', linestyle='--', alpha=0.5)
-    plt.title(f"Monte Carlo Verifikace: Master Sniper 5s (N={SIMULATIONS_COUNT})")
-    plt.ylabel("Zisk / Ztráta (USD)")
-    plt.grid(axis='y', alpha=0.3)
+    plt.axhline(0, color='green', lw=1, ls='--')
+    plt.title("Monte Carlo: Reversal Strategy Verification")
     plt.show()
 
 if __name__ == "__main__":
     main()
+    
