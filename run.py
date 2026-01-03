@@ -51,11 +51,14 @@ class TradingEngine:
         self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.orderbook_streamer = OrderbookStreamer()
         self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
+        
         self.markets, self.positions, self.states = {}, {}, {}
-        self.prev_states, self.pending_rewards = {}, {}
         self.prob_buffers, self.atr_buffers, self.cooldowns = {}, {}, {}
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
         self.running, self.last_cleanup, self.last_market_refresh = False, time.time(), 0
+        
+        # Ochrana proti zahlcení WebSocketu
+        self.active_subscriptions = set()
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
         pos = self.positions.get(cid)
@@ -63,7 +66,7 @@ class TradingEngine:
         now_ts = time.time()
 
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=12)
+            self.prob_buffers[cid] = deque(maxlen=10)
             self.atr_buffers[cid] = deque(maxlen=30)
 
         self.prob_buffers[cid].append(state.prob)
@@ -78,34 +81,34 @@ class TradingEngine:
         if pos.size > 0:
             curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
             duration = now_ts - pos.entry_time
-            if curr_val >= pos.tp_level or curr_val <= pos.sl_level or duration > 50:
+            if curr_val >= pos.tp_level or curr_val <= pos.sl_level or duration > 60:
                 shares = pos.size / pos.entry_price
                 eff_exit = curr_val * EXIT_FEE
                 pnl = (eff_exit - pos.entry_price) * shares
                 self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
                 pos.size, pos.side = 0, None
-                self.cooldowns[cid] = now_ts + 10
+                self.cooldowns[cid] = now_ts + 12
             return
 
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
-            if len(self.prob_buffers[cid]) < 10: return
+            if len(self.prob_buffers[cid]) < 5: return
 
-            # TREND EXHAUSTION FILTER
+            # TREND FILTER (Ochrana proti prudkým pohybům)
             history = list(self.prob_buffers[cid])
-            is_trending_up = all(history[i] < history[i+1] for i in range(-5, -1))
-            is_trending_down = all(history[i] > history[i+1] for i in range(-5, -1))
+            is_trending_up = all(history[i] < history[i+1] for i in range(-4, -1))
+            is_trending_down = all(history[i] > history[i+1] for i in range(-4, -1))
 
             UPPER_THR, LOWER_THR = 0.62, 0.38
 
             if smoothed_prob > UPPER_THR and not is_trending_up:
                 pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.5)
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.5), pos.entry_price - (avg_atr * 2.5)
                 pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
                 logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f}")
 
             elif smoothed_prob < LOWER_THR and not is_trending_down:
                 pos.side, pos.entry_price = "UP", state.prob * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.5)
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.5), pos.entry_price - (avg_atr * 2.5)
                 pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
                 logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f}")
 
@@ -126,7 +129,7 @@ class TradingEngine:
                 trade_count=self.trade_count,
                 win_count=self.win_count,
                 positions={cid: {'side': p.side, 'size': p.size, 'entry_price': p.entry_price} for cid, p in self.positions.items() if p.size > 0},
-                markets={cid: {'asset': m.asset, 'prob': self.states[cid].prob} for cid, m in self.markets.items()}
+                markets={cid: {'asset': m.asset, 'prob': self.states[cid].prob, 'time_left': 10} for cid, m in self.markets.items()}
             )
         except: pass
 
@@ -134,29 +137,50 @@ class TradingEngine:
         try:
             markets = get_15m_markets(assets=["BTC", "ETH", "SOL", "XRP"])
             now = datetime.now(timezone.utc)
-            self.markets.clear()
+            
+            # Ponecháme pouze aktivní ID, stará vymažeme
+            new_markets_dict = {}
             for m in markets:
                 mins_left = (m.end_time - now).total_seconds() / 60
                 if mins_left < 0.5: continue
-                self.markets[m.condition_id] = m
-                self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
+                
+                new_markets_dict[m.condition_id] = m
+                
+                # Přihlásíme se k odběru pouze pokud tento market ještě neznáme
+                if m.condition_id not in self.active_subscriptions:
+                    self.orderbook_streamer.subscribe(m.condition_id, m.token_up, m.token_down)
+                    self.active_subscriptions.add(m.condition_id)
+                    logging.info(f"📡 New subscription: {m.asset} ({m.condition_id[:6]})")
+                
                 if m.condition_id not in self.states:
-                    self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=mins_left / 15.0)
+                    self.states[m.condition_id] = MarketState(asset=m.asset, prob=m.price_up, time_remaining=mins_left/15.0)
                 if m.condition_id not in self.positions:
                     self.positions[m.condition_id] = Position(asset=m.asset)
-        except Exception as e: logging.error(f"Refresh Error: {e}")
+
+            self.markets = new_markets_dict
+            
+            # Vyčištění starých odběrů z paměti
+            active_ids = set(new_markets_dict.keys())
+            self.active_subscriptions = {sid for sid in self.active_subscriptions if sid in active_ids}
+
+        except Exception as e:
+            logging.error(f"⚠️ Refresh Skip (Network Busy): {e}")
 
     async def decision_loop(self):
         while self.running:
             try:
                 await asyncio.sleep(0.5)
                 now_ts = time.time()
+                
                 if now_ts - self.last_cleanup > 1200:
                     gc.collect()
                     self.last_cleanup = now_ts
-                if not self.markets or (now_ts - self.last_market_refresh > 40):
+                
+                # Omezení HTTPS volání na 60s
+                if not self.markets or (now_ts - self.last_market_refresh > 60):
                     self.refresh_markets()
                     self.last_market_refresh = now_ts
+                
                 for cid, m in list(self.markets.items()):
                     state = self.states.get(cid)
                     if not state: continue
@@ -164,13 +188,19 @@ class TradingEngine:
                     if ob and ob.mid_price:
                         state.prob = ob.mid_price
                         self.execute_action(cid, self.strategy.act(state), state)
-            except Exception as e: logging.error(f"Loop Error: {e}")
+            except Exception as e: 
+                logging.error(f"⚠️ Loop Error: {e}")
 
     async def run(self):
         self.running = True
-        tasks = [asyncio.create_task(self.price_streamer.stream()), asyncio.create_task(self.orderbook_streamer.stream()),
-                 asyncio.create_task(self.futures_streamer.stream()), asyncio.create_task(self.decision_loop())]
-        try: await asyncio.gather(*tasks)
+        tasks = [
+            asyncio.create_task(self.price_streamer.stream()),
+            asyncio.create_task(self.orderbook_streamer.stream()),
+            asyncio.create_task(self.futures_streamer.stream()),
+            asyncio.create_task(self.decision_loop())
+        ]
+        try:
+            await asyncio.gather(*tasks)
         finally:
             self.running = False
             for t in tasks: t.cancel()
@@ -183,13 +213,19 @@ async def main():
     parser.add_argument("--dashboard", action="store_true")
     parser.add_argument("--port", type=int, default=5051)
     args = parser.parse_args()
+    
     if args.dashboard and DASHBOARD_AVAILABLE:
         threading.Thread(target=run_dashboard, kwargs={'port': args.port}, daemon=True).start()
+    
     strategy = create_strategy(args.strategy)
-    if isinstance(strategy, RLStrategy) and args.train: strategy.train()
+    if isinstance(strategy, RLStrategy) and args.train:
+        strategy.train()
+        
     engine = TradingEngine(strategy, trade_size=args.size)
     await engine.run()
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
