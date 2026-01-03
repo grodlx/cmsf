@@ -133,7 +133,7 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing and 1% SLIPPAGE/FEE."""
+        """Execute paper trade with 1% slippage and unified reporting."""
         if action == Action.HOLD:
             return
 
@@ -144,93 +144,86 @@ class TradingEngine:
         price = state.prob
         trade_amount = self.trade_size * action.size_multiplier
         
-        # DEFINICE POPLATKU (1% = 0.01)
-        FEE = 1.01 # Při nákupu platíme o 1% víc
-        EXIT_FEE = 0.99 # Při prodeji dostaneme o 1% méně
+        # DEFINICE POPLATKŮ
+        FEE = 1.01      # Nákup o 1% dráž
+        EXIT_FEE = 0.99 # Prodej o 1% levněji
 
-        # Close existing position if switching sides
+        # ZAVÍRÁNÍ POZICE (Switch nebo Close)
         if pos.size > 0:
-            if action.is_sell and pos.side == "UP":
+            # Kontrola cooldownu (30s), aby se předešlo PnL $0
+            hold_duration = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
+            if hold_duration < 30:
+                return
+
+            if (action.is_sell and pos.side == "UP") or (action.is_buy and pos.side == "DOWN"):
                 shares = pos.size / pos.entry_price
-                # Simulujeme, že prodáváme za horší cenu
-                effective_exit_price = price * EXIT_FEE
+                
+                # Výpočet výstupní ceny se slippage
+                if pos.side == "UP":
+                    effective_exit_price = price * EXIT_FEE
+                else:
+                    effective_exit_price = (1 - price) * EXIT_FEE
+                
+                # FINÁLNÍ VÝPOČET PnL
                 pnl = (effective_exit_price - pos.entry_price) * shares
-                self._record_trade(pos, effective_exit_price, pnl, "CLOSE UP", cid=cid)
+                
+                # JEDNOTNÝ ZÁPIS DO VŠECH SYSTÉMŮ
+                self._record_trade(pos, effective_exit_price, pnl, f"CLOSE {pos.side}", cid=cid)
+                
                 self.pending_rewards[cid] = pnl
                 pos.size = 0
                 pos.side = None
                 return
 
-            elif action.is_buy and pos.side == "DOWN":
-                exit_down_price = 1 - price
-                shares = pos.size / pos.entry_price
-                # Simulujeme, že prodáváme za horší cenu
-                effective_exit_price = exit_down_price * EXIT_FEE
-                pnl = (effective_exit_price - pos.entry_price) * shares
-                self._record_trade(pos, effective_exit_price, pnl, "CLOSE DOWN", cid=cid)
-                self.pending_rewards[cid] = pnl
-                pos.size = 0
-                pos.side = None
-                return
-
-        # Open new position
+        # OTEVÍRÁNÍ POZICE
         if pos.size == 0:
-            size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
+            size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "MD")
 
             if action.is_buy:
                 pos.side = "UP"
-                pos.size = trade_amount
-                # Nákup za horší cenu (o 1% vyšší)
                 pos.entry_price = price * FEE
-                pos.entry_time = datetime.now(timezone.utc)
-                pos.entry_prob = price
-                pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {pos.entry_price:.3f} (slip included)")
-                emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
-
             elif action.is_sell:
                 pos.side = "DOWN"
-                pos.size = trade_amount
-                # Nákup za horší cenu (o 1% vyšší pro DOWN token)
                 pos.entry_price = (1 - price) * FEE
-                pos.entry_time = datetime.now(timezone.utc)
-                pos.entry_prob = price
-                pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {pos.entry_price:.3f} (slip included)")
-                emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
+
+            pos.size = trade_amount
+            pos.entry_time = datetime.now(timezone.utc)
+            pos.entry_prob = price
+            pos.time_remaining_at_entry = state.time_remaining
+            
+            print(f"    OPEN {pos.asset} {pos.side} @ {pos.entry_price:.3f} (Slippage included)")
+            emit_trade(f"BUY_{size_label}" if action.is_buy else f"SELL_{size_label}", pos.asset, pos.size)
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
-        """Record completed trade."""
+        """Unified distribution of trade results to Terminal, Dashboard, and CSV."""
+        # 1. Aktualizace globálního stavu
         self.total_pnl += pnl
         self.trade_count += 1
         if pnl > 0:
             self.win_count += 1
-        print(f"    {action} {pos.asset} @ {price:.3f} | PnL: ${pnl:+.2f}")
-        # Emit to dashboard
-        emit_trade(action, pos.asset, pos.size, pnl)
 
-        # Log to CSV
+        # 2. Terminál
+        print(f"    {action} {pos.asset} @ {price:.3f} | Realized PnL: ${pnl:+.2f}")
+
+        # 3. Dashboard (předáváme pnl i celkový součet)
+        emit_trade(action, pos.asset, pos.size, pnl)
+        self._update_dashboard_only() # Vynutí okamžitý update celkového PnL na webu
+
+        # 4. CSV Logger (předáváme identické pnl)
         if self.logger and pos.entry_time:
             duration = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
-            binance_change = 0.0
-            if cid and cid in self.open_prices:
-                current = self.price_streamer.get_price(pos.asset)
-                if current > 0 and self.open_prices[cid] > 0:
-                    binance_change = (current - self.open_prices[cid]) / self.open_prices[cid]
-
             self.logger.log_trade(
                 asset=pos.asset,
-                action="BUY" if "UP" in action else "SELL",
+                action=action,
                 side=pos.side or "UNKNOWN",
                 entry_price=pos.entry_price,
                 exit_price=price,
                 size=pos.size,
-                pnl=pnl,
+                pnl=pnl, # Identické číslo jako v terminálu
                 duration_sec=duration,
                 time_remaining=pos.time_remaining_at_entry,
                 prob_at_entry=pos.entry_prob,
                 prob_at_exit=price,
-                binance_change=binance_change,
                 condition_id=cid
             )
 
@@ -449,39 +442,63 @@ class TradingEngine:
                             )
 
     def _update_dashboard_only(self):
-        """Update dashboard state without printing to console."""
+        """
+        Synchronizuje aktuální stav obchodování do webového dashboardu.
+        Zajišťuje, že PnL v UI odpovídá terminálu a CSV logům.
+        """
         now = datetime.now(timezone.utc)
         dashboard_markets = {}
         dashboard_positions = {}
 
+        # 1. Příprava dat o trzích
         for cid, m in self.markets.items():
             state = self.states.get(cid)
             pos = self.positions.get(cid)
+            
             if state:
                 mins_left = (m.end_time - now).total_seconds() / 60
-                vel = state._velocity()
+                # Výpočet hybnosti (velocity) pro grafy v dashboardu
+                vel = state._velocity() if hasattr(state, '_velocity') else 0.0
+                
                 dashboard_markets[cid] = {
                     'asset': m.asset,
                     'prob': state.prob,
                     'time_left': mins_left,
                     'velocity': vel,
+                    'best_bid': getattr(state, 'best_bid', 0.0),
+                    'best_ask': getattr(state, 'best_ask', 0.0)
                 }
-                if pos:
+
+                # 2. Příprava dat o otevřených pozicích
+                if pos and pos.size > 0:
+                    # Výpočet nerealizovaného PnL pro dashboard (zohledňuje vstupní cenu se slippage)
+                    if pos.side == "UP":
+                        current_val = state.prob
+                    else:
+                        current_val = (1 - state.prob)
+                    
+                    shares = pos.size / pos.entry_price
+                    unrealized_pnl = (current_val - pos.entry_price) * shares
+
                     dashboard_positions[cid] = {
                         'side': pos.side,
                         'size': pos.size,
                         'entry_price': pos.entry_price,
+                        'current_price': current_val,
+                        'unrealized_pnl': unrealized_pnl
                     }
 
-        update_dashboard_state(
-            strategy_name=self.strategy.name,
-            total_pnl=self.total_pnl,
-            trade_count=self.trade_count,
-            win_count=self.win_count,
-            positions=dashboard_positions,
-            markets=dashboard_markets,
-        )
-
+        # 3. Odeslání sjednocených dat přes SocketIO
+        if DASHBOARD_AVAILABLE:
+            update_dashboard_state(
+                strategy_name=self.strategy.name,
+                total_pnl=self.total_pnl,  # Globální realizované PnL (ze všech uzavřených obchodů)
+                trade_count=self.trade_count,
+                win_count=self.win_count,
+                positions=dashboard_positions,
+                markets=dashboard_markets,
+                timestamp=now.isoformat()
+            )
     def print_status(self):
         """Print current status."""
         now = datetime.now(timezone.utc)
