@@ -39,7 +39,7 @@ class Position:
     side: Optional[str] = None
     size: float = 0.0
     entry_price: float = 0.0
-    entry_time: Optional[datetime] = None
+    entry_time: float = 0.0
     tp_level: float = 0.0
     sl_level: float = 0.0
 
@@ -52,7 +52,7 @@ class TradingEngine:
         self.futures_streamer = FuturesStreamer(["BTC", "ETH", "SOL", "XRP"])
         self.markets, self.positions, self.states = {}, {}, {}
         self.prev_states, self.pending_rewards = {}, {}
-        self.prob_buffers, self.mean_buffers, self.atr_buffers, self.cooldowns = {}, {}, {}, {}
+        self.prob_buffers, self.atr_buffers, self.cooldowns = {}, {}, {}
         self.total_pnl, self.trade_count, self.win_count = 0.0, 0, 0
         self.running, self.last_cleanup, self.last_market_refresh = False, time.time(), 0
 
@@ -62,57 +62,66 @@ class TradingEngine:
         now_ts = time.time()
 
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=8)
-            self.mean_buffers[cid] = deque(maxlen=100) # Zkráceno na ~5 min pro rychlejší adaptaci
-            self.atr_buffers[cid] = deque(maxlen=30)
+            self.prob_buffers[cid] = deque(maxlen=6) # cca 3s vyhlazení
+            self.atr_buffers[cid] = deque(maxlen=25)
 
         self.prob_buffers[cid].append(state.prob)
-        self.mean_buffers[cid].append(state.prob)
         vol = getattr(state, 'realized_vol_5m', 0.005)
         self.atr_buffers[cid].append(vol if vol > 0 else 0.005)
         
         smoothed_prob = sum(self.prob_buffers[cid]) / len(self.prob_buffers[cid])
-        current_mean = sum(self.mean_buffers[cid]) / len(self.mean_buffers[cid])
         avg_atr = sum(self.atr_buffers[cid]) / len(self.atr_buffers[cid])
 
         FEE, EXIT_FEE = 1.01, 0.99 
 
+        # --- LOGIKA VÝSTUPU ---
         if pos.size > 0:
             curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
-            if curr_val >= pos.tp_level or curr_val <= pos.sl_level:
+            duration = now_ts - pos.entry_time
+            
+            # 1. ATR Výstupy | 2. Time Exit (45s) | 3. Hard Reversal (prob pod 0.5)
+            is_tp = curr_val >= pos.tp_level
+            is_sl = curr_val <= pos.sl_level
+            is_timeout = duration > 45 
+
+            if is_tp or is_sl or is_timeout:
                 shares = pos.size / pos.entry_price
                 eff_exit = curr_val * EXIT_FEE
                 pnl = (eff_exit - pos.entry_price) * shares
-                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side}", cid=cid)
+                
+                reason = "TP" if is_tp else ("SL" if is_sl else "TIME")
+                self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
+                self.pending_rewards[cid] = pnl
                 pos.size, pos.side = 0, None
                 self.cooldowns[cid] = now_ts + 8
             return
 
+        # --- LOGIKA VSTUPU (FIXNÍ THRESHOLDY + ATR FILTR) ---
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
-            if len(self.mean_buffers[cid]) < 30: return 
+            # Filtr: Neobchodujeme, pokud je volatilita extrémně nízká (poplatky nás zabijí)
+            if avg_atr < 0.0015: return 
 
-            # OPRAVA: Dynamické thresholdy se stropem (Hard Cap)
-            # Pokud Mean Driftuje k 0.99, UPPER_THR zůstane na 0.75 a bot stále uvidí extrém
-            UPPER_THR = min(max(current_mean + 0.06, 0.60), 0.72)
-            LOWER_THR = max(min(current_mean - 0.06, 0.40), 0.28)
+            # Fixní, ale agresivnější thresholdy
+            UPPER_THR = 0.61
+            LOWER_THR = 0.39
 
             if smoothed_prob > UPPER_THR:
                 pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.2)
-                pos.size = self.trade_size * action.size_multiplier
-                logging.info(f"📉 [REV] SHORT {pos.asset} | Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.0)
+                pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
+                logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f} | ATR: {avg_atr:.5f}")
 
             elif smoothed_prob < LOWER_THR:
                 pos.side, pos.entry_price = "UP", state.prob * FEE
-                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.3), pos.entry_price - (avg_atr * 2.2)
-                pos.size = self.trade_size * action.size_multiplier
-                logging.info(f"📈 [REV] LONG {pos.asset} | Prob: {smoothed_prob:.3f} | Mean: {current_mean:.3f}")
+                pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.0)
+                pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
+                logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f} | ATR: {avg_atr:.5f}")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
         self.trade_count += 1
         if pnl > 0: self.win_count += 1
-        logging.info(f"💰 {action} {pos.asset} PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
+        logging.info(f"💰 {action} {pos.asset} | PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
         emit_trade(action, pos.asset, pos.size, pnl)
 
     def refresh_markets(self):
@@ -136,11 +145,11 @@ class TradingEngine:
             try:
                 await asyncio.sleep(0.5)
                 now_ts = time.time()
-                if now_ts - self.last_cleanup > 1800:
+                if now_ts - self.last_cleanup > 1200: # Častější cleanup
                     gc.collect()
                     self.last_cleanup = now_ts
 
-                if not self.markets or (now_ts - self.last_market_refresh > 45):
+                if not self.markets or (now_ts - self.last_market_refresh > 40):
                     self.refresh_markets()
                     self.last_market_refresh = now_ts
                 
@@ -170,10 +179,8 @@ async def main():
     parser.add_argument("--dashboard", action="store_true")
     parser.add_argument("--port", type=int, default=5050)
     args = parser.parse_args()
-
     if args.dashboard and DASHBOARD_AVAILABLE:
         threading.Thread(target=run_dashboard, kwargs={'port': args.port}, daemon=True).start()
-
     strategy = create_strategy(args.strategy)
     if isinstance(strategy, RLStrategy) and args.train: strategy.train()
     engine = TradingEngine(strategy, trade_size=args.size)
