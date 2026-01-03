@@ -441,23 +441,21 @@ class TradingEngine:
                                 cumulative_wins=self.win_count
                             )
 
-    def _update_dashboard_only(self):
+   def _update_dashboard_only(self):
         """
         Synchronizuje aktuální stav obchodování do webového dashboardu.
-        Zajišťuje, že PnL v UI odpovídá terminálu a CSV logům.
+        Opraveno pro kompatibilitu s dashboard_cinematic.py.
         """
         now = datetime.now(timezone.utc)
         dashboard_markets = {}
         dashboard_positions = {}
 
-        # 1. Příprava dat o trzích
         for cid, m in self.markets.items():
             state = self.states.get(cid)
             pos = self.positions.get(cid)
             
             if state:
                 mins_left = (m.end_time - now).total_seconds() / 60
-                # Výpočet hybnosti (velocity) pro grafy v dashboardu
                 vel = state._velocity() if hasattr(state, '_velocity') else 0.0
                 
                 dashboard_markets[cid] = {
@@ -465,18 +463,11 @@ class TradingEngine:
                     'prob': state.prob,
                     'time_left': mins_left,
                     'velocity': vel,
-                    'best_bid': getattr(state, 'best_bid', 0.0),
-                    'best_ask': getattr(state, 'best_ask', 0.0)
                 }
 
-                # 2. Příprava dat o otevřených pozicích
                 if pos and pos.size > 0:
-                    # Výpočet nerealizovaného PnL pro dashboard (zohledňuje vstupní cenu se slippage)
-                    if pos.side == "UP":
-                        current_val = state.prob
-                    else:
-                        current_val = (1 - state.prob)
-                    
+                    # Výpočet nerealizovaného PnL (zahrnuje vstupní cenu se slippage)
+                    current_val = state.prob if pos.side == "UP" else (1 - state.prob)
                     shares = pos.size / pos.entry_price
                     unrealized_pnl = (current_val - pos.entry_price) * shares
 
@@ -484,21 +475,20 @@ class TradingEngine:
                         'side': pos.side,
                         'size': pos.size,
                         'entry_price': pos.entry_price,
-                        'current_price': current_val,
                         'unrealized_pnl': unrealized_pnl
                     }
 
-        # 3. Odeslání sjednocených dat přes SocketIO
         if DASHBOARD_AVAILABLE:
+            # Odstraněn parametr 'timestamp', který způsoboval pád
             update_dashboard_state(
                 strategy_name=self.strategy.name,
-                total_pnl=self.total_pnl,  # Globální realizované PnL (ze všech uzavřených obchodů)
+                total_pnl=self.total_pnl,
                 trade_count=self.trade_count,
                 win_count=self.win_count,
                 positions=dashboard_positions,
-                markets=dashboard_markets,
-                timestamp=now.isoformat()
+                markets=dashboard_markets
             )
+            
     def print_status(self):
         """Print current status."""
         now = datetime.now(timezone.utc)
