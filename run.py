@@ -21,6 +21,7 @@ from strategies import (
     RLStrategy,
 )
 
+# Dashboard integrace
 try:
     from dashboard_cinematic import update_dashboard_state, update_rl_metrics, emit_rl_buffer, run_dashboard, emit_trade
     DASHBOARD_AVAILABLE = True
@@ -62,7 +63,7 @@ class TradingEngine:
         now_ts = time.time()
 
         if cid not in self.prob_buffers:
-            self.prob_buffers[cid] = deque(maxlen=6) # cca 3s vyhlazení
+            self.prob_buffers[cid] = deque(maxlen=6) 
             self.atr_buffers[cid] = deque(maxlen=25)
 
         self.prob_buffers[cid].append(state.prob)
@@ -74,12 +75,11 @@ class TradingEngine:
 
         FEE, EXIT_FEE = 1.01, 0.99 
 
-        # --- LOGIKA VÝSTUPU ---
+        # --- LOGIKA VÝSTUPU (Realizace PnL) ---
         if pos.size > 0:
             curr_val = state.prob if pos.side == "UP" else (1 - state.prob)
             duration = now_ts - pos.entry_time
             
-            # 1. ATR Výstupy | 2. Time Exit (45s) | 3. Hard Reversal (prob pod 0.5)
             is_tp = curr_val >= pos.tp_level
             is_sl = curr_val <= pos.sl_level
             is_timeout = duration > 45 
@@ -91,17 +91,16 @@ class TradingEngine:
                 
                 reason = "TP" if is_tp else ("SL" if is_sl else "TIME")
                 self._record_trade(pos, eff_exit, pnl, f"CLOSE {pos.side} ({reason})", cid=cid)
+                
                 self.pending_rewards[cid] = pnl
                 pos.size, pos.side = 0, None
                 self.cooldowns[cid] = now_ts + 8
             return
 
-        # --- LOGIKA VSTUPU (FIXNÍ THRESHOLDY + ATR FILTR) ---
+        # --- LOGIKA VSTUPU (Reversal) ---
         if pos.size == 0 and now_ts > self.cooldowns.get(cid, 0):
-            # Filtr: Neobchodujeme, pokud je volatilita extrémně nízká (poplatky nás zabijí)
             if avg_atr < 0.0015: return 
 
-            # Fixní, ale agresivnější thresholdy
             UPPER_THR = 0.61
             LOWER_THR = 0.39
 
@@ -109,20 +108,51 @@ class TradingEngine:
                 pos.side, pos.entry_price = "DOWN", (1 - state.prob) * FEE
                 pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.0)
                 pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
-                logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f} | ATR: {avg_atr:.5f}")
+                logging.info(f"📉 [REV] SHORT {pos.asset} @ {pos.entry_price:.3f}")
 
             elif smoothed_prob < LOWER_THR:
                 pos.side, pos.entry_price = "UP", state.prob * FEE
                 pos.tp_level, pos.sl_level = pos.entry_price + (avg_atr * 1.4), pos.entry_price - (avg_atr * 2.0)
                 pos.size, pos.entry_time = self.trade_size * action.size_multiplier, now_ts
-                logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f} | ATR: {avg_atr:.5f}")
+                logging.info(f"📈 [REV] LONG {pos.asset} @ {pos.entry_price:.3f}")
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
         self.total_pnl += pnl
         self.trade_count += 1
         if pnl > 0: self.win_count += 1
-        logging.info(f"💰 {action} {pos.asset} | PnL: ${pnl:+.2f} | Total: ${self.total_pnl:.2f}")
+        logging.info(f"💰 {action} {pos.asset} | PnL: ${pnl:+.2f} | Realized Total: ${self.total_pnl:.2f}")
+        
+        # Odeslání do dashboardu (Seznam obchodů)
         emit_trade(action, pos.asset, pos.size, pnl)
+        # Okamžitá aktualizace celkového PnL
+        self._update_dashboard_only()
+
+    def _update_dashboard_only(self):
+        if not DASHBOARD_AVAILABLE: return
+        try:
+            now = datetime.now(timezone.utc)
+            dashboard_m, dashboard_p = {}, {}
+            
+            # Sestavení trhů a pozic pro dashboard
+            for cid, m in self.markets.items():
+                s, p = self.states.get(cid), self.positions.get(cid)
+                if s:
+                    dashboard_m[cid] = {'asset': m.asset, 'prob': s.prob, 'time_left': (m.end_time - now).total_seconds()/60}
+                    if p and p.size > 0:
+                        # Zde dashboardu posíláme prázdné nerealizované pnl, aby nás zajímalo jen to uzavřené
+                        dashboard_p[cid] = {'side': p.side, 'size': p.size, 'entry_price': p.entry_price, 'unrealized_pnl': 0.0}
+            
+            # Odeslání celkového realizovaného stavu
+            update_dashboard_state(
+                strategy_name=self.strategy.name,
+                total_pnl=self.total_pnl,  # Pouze realizované PnL
+                trade_count=self.trade_count,
+                win_count=self.win_count,
+                positions=dashboard_p,
+                markets=dashboard_m
+            )
+        except Exception as e:
+            pass
 
     def refresh_markets(self):
         try:
@@ -141,18 +171,24 @@ class TradingEngine:
         except Exception as e: logging.error(f"Refresh Error: {e}")
 
     async def decision_loop(self):
+        tick = 0
         while self.running:
             try:
                 await asyncio.sleep(0.5)
+                tick += 1
                 now_ts = time.time()
-                if now_ts - self.last_cleanup > 1200: # Častější cleanup
+                
+                # Cleanup paměti
+                if now_ts - self.last_cleanup > 1200:
                     gc.collect()
                     self.last_cleanup = now_ts
 
+                # Refresh trhů
                 if not self.markets or (now_ts - self.last_market_refresh > 40):
                     self.refresh_markets()
                     self.last_market_refresh = now_ts
                 
+                # Hlavní logika a dashboard heartbeat
                 for cid, m in list(self.markets.items()):
                     state = self.states.get(cid)
                     if not state: continue
@@ -160,10 +196,16 @@ class TradingEngine:
                     if ob and ob.mid_price:
                         state.prob = ob.mid_price
                         self.execute_action(cid, self.strategy.act(state), state)
+                
+                # Pravidelný update dashboardu i bez obchodů (heartbeat)
+                if tick % 10 == 0:
+                    self._update_dashboard_only()
+
             except Exception as e: logging.error(f"Loop Error: {e}")
 
     async def run(self):
         self.running = True
+        self.refresh_markets()
         tasks = [asyncio.create_task(self.price_streamer.stream()), asyncio.create_task(self.orderbook_streamer.stream()),
                  asyncio.create_task(self.futures_streamer.stream()), asyncio.create_task(self.decision_loop())]
         try: await asyncio.gather(*tasks)
